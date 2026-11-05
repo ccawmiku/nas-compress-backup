@@ -59,6 +59,7 @@ def init():
           paused INTEGER NOT NULL DEFAULT 0,cloud_dest TEXT,run_id TEXT,
           progress TEXT NOT NULL DEFAULT '{}',last_scan REAL,last_success REAL,last_window TEXT,
           scan_id TEXT,error TEXT,catalog_generation INTEGER NOT NULL DEFAULT 0,
+          cancel_requested INTEGER NOT NULL DEFAULT 0,
           created REAL NOT NULL,updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS files(
           task_id TEXT NOT NULL,path TEXT NOT NULL,root TEXT,relative TEXT,size INTEGER,
@@ -95,8 +96,12 @@ def init():
         CREATE INDEX IF NOT EXISTS object_groups ON objects(group_id,status);
         CREATE INDEX IF NOT EXISTS log_tasks ON logs(task_id,id);
         ''')
+        task_columns = {r['name'] for r in db.execute('PRAGMA table_info(tasks)')}
+        if 'cancel_requested' not in task_columns:
+            db.execute('ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0')
         for key, value in DEFAULTS.items():
             db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (key, json.dumps(value)))
+        db.execute("INSERT OR IGNORE INTO settings VALUES ('text_cache_bytes','0')")
 
 
 @contextmanager

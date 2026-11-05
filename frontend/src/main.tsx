@@ -53,6 +53,7 @@ const states: Any = {
   complete: "已完成",
   attention: "有文件待处理",
   error: "需要处理",
+  stopped: "已结束",
 };
 const stages: Any = {
   scan: "扫描目录",
@@ -122,7 +123,7 @@ function IconButton({
 function Badge({ value }: any) {
   return (
     <span
-      className={`badge badge-sm ${value === "error" || value === "attention" ? "badge-warning" : value === "complete" ? "badge-success" : "badge-ghost"}`}
+      className={`badge badge-sm whitespace-nowrap ${value === "error" || value === "attention" ? "badge-warning" : value === "complete" ? "badge-success" : "badge-ghost"}`}
     >
       {states[value] || value}
     </span>
@@ -372,6 +373,7 @@ function FolderPicker({ selected, choose, close, report }: any) {
 }
 
 function TaskEditor({ task, close, saved, report }: any) {
+  const [deleting, setDeleting] = useState(false);
   const [form, setForm] = useState<Any>(
     task
       ? {
@@ -400,6 +402,33 @@ function TaskEditor({ task, close, saved, report }: any) {
       setBusy(false);
     }
   }
+  if (deleting)
+    return (
+      <Modal title="移除任务" close={() => setDeleting(false)}>
+        <p className="text-sm">
+          移除“{task.name}”的本地任务记录。NAS
+          原始文件和百度网盘中的备份继续保留。
+        </p>
+        <div className="flex justify-end gap-2 mt-6">
+          <button className="btn btn-ghost" onClick={() => setDeleting(false)}>
+            取消
+          </button>
+          <button
+            className="btn btn-error"
+            onClick={async () => {
+              try {
+                await api("/tasks/" + task.id, "DELETE");
+                saved("");
+              } catch (e: any) {
+                report(e.message);
+              }
+            }}
+          >
+            移除任务记录
+          </button>
+        </div>
+      </Modal>
+    );
   return (
     <>
       {!picker && (
@@ -482,6 +511,16 @@ function TaskEditor({ task, close, saved, report }: any) {
               </span>
             </div>
             <div className="flex justify-end gap-2">
+              {task && (
+                <button
+                  className="btn btn-ghost text-error mr-auto"
+                  type="button"
+                  disabled={!!task.operation}
+                  onClick={() => setDeleting(true)}
+                >
+                  移除任务
+                </button>
+              )}
               <button className="btn btn-ghost" type="button" onClick={close}>
                 取消
               </button>
@@ -719,7 +758,9 @@ function FileTable({ task, type, report, revision }: any) {
                 ))}
             </select>
           )}
-          <span className="text-sm text-base-content/60">{data.total} 项</span>
+          <span className="text-sm text-base-content/60 whitespace-nowrap">
+            {data.total} 项
+          </span>
           <button
             className="btn btn-ghost btn-sm btn-square"
             aria-label="刷新列表"
@@ -734,7 +775,7 @@ function FileTable({ task, type, report, revision }: any) {
         </div>
       </div>
       <div className="overflow-x-auto border border-base-300 rounded-box">
-        <table className="table table-sm">
+        <table className="table table-sm min-w-[720px]">
           <thead>
             <tr>
               <th>状态</th>
@@ -750,13 +791,13 @@ function FileTable({ task, type, report, revision }: any) {
                 <td>
                   {type === "changes" ? (
                     <span
-                      className={`badge badge-sm ${kinds[f.kind]?.[1] || "badge-ghost"}`}
+                      className={`badge badge-sm whitespace-nowrap ${kinds[f.kind]?.[1] || "badge-ghost"}`}
                     >
                       {kinds[f.kind]?.[0] || f.kind}
                     </span>
                   ) : (
                     <span
-                      className={`badge badge-sm ${f.present ? "badge-success badge-outline" : "badge-neutral badge-outline"}`}
+                      className={`badge badge-sm whitespace-nowrap ${f.present ? "badge-success badge-outline" : "badge-neutral badge-outline"}`}
                     >
                       {f.present ? "源仍在" : "仅网盘保留"}
                     </span>
@@ -1340,6 +1381,7 @@ function SettingsPage({ report, notify, changed }: any) {
 }
 
 function App() {
+  const [ending, setEnding] = useState("");
   const [auth, setAuth] = useState<Any>(),
     [data, setData] = useState<Any>({ tasks: [], disk: {}, night: {} }),
     [selected, setSelected] = useState(""),
@@ -1405,7 +1447,9 @@ function App() {
             ? "已加入扫描队列"
             : verb === "pause"
               ? "当前工作收尾后暂停"
-              : "已继续任务",
+              : verb === "cancel"
+                ? "当前工作收尾后结束本次运行"
+                : "已继续任务",
       );
     } catch (e: any) {
       report(e.message);
@@ -1507,6 +1551,15 @@ function App() {
                   </div>
                 </div>
                 <div className="flex gap-1 flex-wrap">
+                  {!!task.operation && (
+                    <IconButton
+                      icon={X}
+                      disabled={!!task.cancel_requested}
+                      onClick={() => setEnding(task.id)}
+                    >
+                      结束本次
+                    </IconButton>
+                  )}
                   <IconButton icon={Settings} onClick={() => setEditor(task)}>
                     编辑
                   </IconButton>
@@ -1821,6 +1874,28 @@ function App() {
           </div>
         </div>
       </aside>
+      {ending && (
+        <Modal title="结束本次运行" close={() => setEnding("")}>
+          <p className="text-sm">
+            当前包和已经开始的上传收尾后结束。已提交的备份和 NAS
+            原始文件保留；未提交的本地工作副本会释放。之后可修改来源或重新扫描。
+          </p>
+          <div className="flex justify-end gap-2 mt-6">
+            <button className="btn btn-ghost" onClick={() => setEnding("")}>
+              返回
+            </button>
+            <button
+              className="btn btn-warning"
+              onClick={() => {
+                action(ending, "cancel");
+                setEnding("");
+              }}
+            >
+              结束本次
+            </button>
+          </div>
+        </Modal>
+      )}
       {editor !== undefined && (
         <TaskEditor
           task={editor}

@@ -81,3 +81,29 @@ def test_overnight_window_and_manual_override(state):
 def test_redaction(state):
     text = core.redact('secret fixture-token-only endpoint https://example.invalid/private-key/value')
     assert 'fixture-token-only' not in text and 'private-key' not in text
+
+
+def test_cancel_releases_only_uncommitted_work_and_retains_sources(state):
+    source = state / 'keep.txt'
+    source.write_text('original', encoding='utf-8')
+    task = make_task(state)
+    directory = core.OUT / task['id'] / 'group'
+    directory.mkdir(parents=True)
+    (directory / 'partial.7z').write_bytes(b'owned pending output')
+    core.execute("INSERT INTO groups(id,task_id,status,directory,created) VALUES (?,?,'building',?,?)",
+                 ('group', task['id'], str(directory), core.now()))
+    core.execute('UPDATE tasks SET paused=1,cancel_requested=1 WHERE id=?', (task['id'],))
+    worker.settle_cancellations()
+    current = core.one('SELECT * FROM tasks WHERE id=?', (task['id'],))
+    assert current['operation'] is None and not current['paused']
+    assert source.read_text() == 'original'
+    assert not directory.exists()
+    assert core.one('SELECT status FROM groups')['status'] == 'cancelled'
+
+
+def test_night_window_validation_and_numeric_settings(state):
+    with TestClient(app) as client:
+        client.post('/api/auth/setup', json={'username': 'owner', 'password': 'testing-password'})
+        assert client.put('/api/settings', json={'night_start': '22:00', 'night_end': '22:00'}).status_code == 400
+        assert client.put('/api/settings', json={'quota_gb': '128'}).status_code == 200
+        assert core.settings()['quota_gb'] == 128

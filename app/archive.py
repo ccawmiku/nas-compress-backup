@@ -39,11 +39,11 @@ def tool(command: list[str], task_id: str, stage: str, cwd=None):
     tail = bytearray()
     last = 0.0
     assert proc.stdout
-    for data in iter(lambda: proc.stdout.read(256), b''):
+    for data in iter(lambda: proc.stdout.read(1), b''):
         tail.extend(data)
         if len(tail) > 12000:
             del tail[:-12000]
-        matches = re.findall(rb'(\d{1,3}(?:\.\d+)?)%', data)
+        matches = re.findall(rb'(\d{1,3}(?:\.\d+)?)%', tail[-12:]) if data == b'%' else []
         if matches and time.monotonic() - last > 0.4:
             core.progress(task_id, stage, percent=min(100, float(matches[-1])))
             last = time.monotonic()
@@ -89,9 +89,17 @@ def create_group(task: dict) -> dict:
 
 
 def _record_file(db, task_id: str, item: dict, parts: list):
+    old = db.execute('SELECT text_content FROM files WHERE task_id=? AND path=?', (task_id, item['path'])).fetchone()
+    old_bytes = len((old['text_content'] or '').encode()) if old else 0
+    value = item.get('text_content')
+    used = int(json.loads(db.execute("SELECT value FROM settings WHERE key='text_cache_bytes'").fetchone()['value']))
+    new_bytes = len((value or '').encode())
+    if used - old_bytes + new_bytes > 128 * 1024**2:
+        value, new_bytes = None, 0
+    db.execute("UPDATE settings SET value=? WHERE key='text_cache_bytes'", (str(max(0, used - old_bytes + new_bytes)),))
     db.execute('''INSERT OR REPLACE INTO files(task_id,path,root,relative,size,mtime_ns,ctime_ns,sha256,parts,present,backed_up,text_content)
       VALUES (?,?,?,?,?,?,?,?,?,1,?,?)''', (task_id, item['path'], item['root'], item['relative'], item['size'],
-      item['mtime_ns'], item['ctime_ns'], item['sha256'], json.dumps(parts), core.now(), item.get('text_content')))
+      item['mtime_ns'], item['ctime_ns'], item['sha256'], json.dumps(parts), core.now(), value))
 
 
 def resolve_reuse(task: dict, item: dict) -> bool:
@@ -105,9 +113,11 @@ def resolve_reuse(task: dict, item: dict) -> bool:
         _record_file(db, task['id'], item, json.loads(existing['parts']))
         if deleted and existing['path'] != item['path']:
             db.execute('DELETE FROM files WHERE task_id=? AND path=?', (task['id'], existing['path']))
+            cached = int(json.loads(db.execute("SELECT value FROM settings WHERE key='text_cache_bytes'").fetchone()['value']))
+            db.execute("UPDATE settings SET value=? WHERE key='text_cache_bytes'", (str(max(0, cached - len((existing.get('text_content') or '').encode()))),))
             db.execute("UPDATE scan SET state='done',kind='moved_from' WHERE task_id=? AND path=?", (task['id'], existing['path']))
         kind = 'moved' if deleted and existing['path'] != item['path'] else 'metadata' if current else 'reused'
-        db.execute("UPDATE scan SET state='done',kind=? WHERE task_id=? AND path=?", (kind, task['id'], item['path']))
+        db.execute("UPDATE scan SET state='done',kind=?,text_content=NULL WHERE task_id=? AND path=?", (kind, task['id'], item['path']))
     core.progress(task['id'], 'hash', catalog_dirty=True)
     return True
 

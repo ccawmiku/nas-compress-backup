@@ -167,8 +167,10 @@ def task_view(task: dict):
        FROM objects o JOIN groups g ON g.id=o.group_id WHERE g.task_id=? AND g.run_id=?''', (task['id'], task['run_id']))
     result['upload'] = upload
     result['scan_summary'] = worker.summary(task['id'])
-    result['processed'] = core.one("SELECT COUNT(*) count,COALESCE(SUM(size),0) bytes FROM scan WHERE task_id=? AND state='done' AND kind NOT IN ('unchanged','deleted','moved_from')", (task['id'],))
+    result['processed'] = core.one("SELECT COUNT(*) count,COALESCE(SUM(size),0) bytes FROM scan WHERE task_id=? AND state='done' AND kind NOT IN ('unchanged','moved_from')", (task['id'],))
     result['files'] = core.one('SELECT COUNT(*) count,COALESCE(SUM(size),0) bytes,SUM(CASE WHEN present=0 THEN 1 ELSE 0 END) retained FROM files WHERE task_id=?', (task['id'],))
+    run = core.one('SELECT started FROM runs WHERE id=?', (task['run_id'],)) if task['run_id'] else None
+    result['run_started'] = run['started'] if run else None
     return result
 
 
@@ -221,12 +223,35 @@ def create_task(body: dict):
 @app.patch('/api/tasks/{task_id}')
 def update_task(task_id: str, body: dict):
     task = task_detail(task_id)
-    if task['operation']:
-        raise HTTPException(409, '先暂停并结束当前处理后再修改来源配置')
     name, roots, excludes, auto = task_values(body)
+    if task['operation']:
+        if roots != task['roots'] or excludes != task['excludes']:
+            raise HTTPException(409, '请先结束本次运行，再修改来源目录或排除规则')
+        core.execute('UPDATE tasks SET name=?,auto=?,updated=? WHERE id=?', (name, int(auto), core.now(), task_id))
+        return {'ok': True}
     core.execute('UPDATE tasks SET name=?,roots=?,excludes=?,auto=?,run_id=NULL,last_scan=NULL,status=?,updated=? WHERE id=?',
                  (name, json.dumps(roots), json.dumps(excludes), int(auto), 'draft', core.now(), task_id))
     return {'ok': True}
+
+
+@app.delete('/api/tasks/{task_id}')
+def delete_task(task_id: str):
+    task = task_detail(task_id)
+    if task['operation']:
+        raise HTTPException(409, '请先结束本次运行')
+    with core.connect() as db:
+        group_ids = [r['id'] for r in db.execute('SELECT id FROM groups WHERE task_id=?', (task_id,))]
+        for group_id in group_ids:
+            db.execute('DELETE FROM members WHERE group_id=?', (group_id,))
+            db.execute('DELETE FROM objects WHERE group_id=?', (group_id,))
+        for table in ('groups', 'scan', 'files', 'runs', 'logs'):
+            db.execute(f'DELETE FROM {table} WHERE task_id=?', (task_id,))
+        db.execute('DELETE FROM tasks WHERE id=?', (task_id,))
+    for parent in (core.WORK, core.OUT):
+        directory = parent / task_id
+        if directory.exists():
+            core.owned_remove(directory, parent)
+    return {'ok': True, 'cloud_files_retained': True}
 
 
 @app.post('/api/tasks/{task_id}/{action}')
@@ -234,7 +259,9 @@ def task_action(task_id: str, action: str):
     task = core.one('SELECT * FROM tasks WHERE id=?', (task_id,))
     if not task:
         raise HTTPException(404, '任务不存在')
-    if action == 'pause':
+    if action == 'cancel':
+        core.execute("UPDATE tasks SET paused=1,cancel_requested=1,status='pausing',updated=? WHERE id=?", (core.now(), task_id))
+    elif action == 'pause':
         core.execute("UPDATE tasks SET paused=1,status='pausing',updated=? WHERE id=?", (core.now(), task_id))
     elif action in ('resume', 'retry'):
         core.execute("UPDATE tasks SET paused=0,status='queued',error=NULL,updated=? WHERE id=?", (core.now(), task_id))
@@ -405,8 +432,17 @@ def put_settings(body: dict):
                 time.strptime(values[name], '%H:%M')
             except (ValueError, TypeError):
                 raise ValueError('夜间时段应为 HH:MM')
-    if 'quota_gb' in values and not 1 <= int(values['quota_gb']) <= 4096:
-        raise ValueError('暂存配额范围为1至4096GB')
+    merged = {**core.settings(), **values}
+    if merged['night_start'] and merged['night_end'] and merged['night_start'] == merged['night_end']:
+        raise ValueError('夜间开始和结束不能相同')
+    for key, maximum in (('quota_gb', 4096), ('upload_concurrency', 2), ('cpu_threads', 1)):
+        if key in values:
+            try:
+                values[key] = int(values[key])
+            except (ValueError, TypeError):
+                raise ValueError('数量设置应为整数')
+            if not 1 <= values[key] <= maximum:
+                raise ValueError('数量设置超出允许范围')
     if 'cloud_url' in values:
         url = urlsplit(str(values['cloud_url']))
         if url.scheme not in ('http', 'https') or not url.hostname or url.username or url.password or url.query:

@@ -72,7 +72,7 @@ def scan_task(task: dict, stopped=lambda: False) -> dict:
                         value = str(path)
                         stat = path.stat()
                         old = db.execute('SELECT * FROM files WHERE task_id=? AND path=?', (task_id, value)).fetchone()
-                        kind = 'new' if old is None else ('unchanged' if (old['size'], old['mtime_ns'], old['ctime_ns']) ==
+                        kind = 'new' if old is None else ('unchanged' if old['present'] and (old['size'], old['mtime_ns'], old['ctime_ns']) ==
                                 (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) else 'modified')
                         state = 'done' if kind == 'unchanged' else 'pending'
                         cursor = db.execute(f'''INSERT OR IGNORE INTO {table}(task_id,path,root,relative,size,mtime_ns,ctime_ns,kind,state,offset,staged_parts)

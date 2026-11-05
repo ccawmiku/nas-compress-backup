@@ -23,6 +23,31 @@ UPLOADS = ThreadPoolExecutor(max_workers=2, thread_name_prefix='cloud-upload')
 FUTURES = {}
 
 
+def settle_cancellations():
+    for task in core.rows('SELECT * FROM tasks WHERE cancel_requested=1'):
+        active = False
+        for object_id, future in list(FUTURES.items()):
+            obj = core.one('SELECT g.task_id FROM objects o JOIN groups g ON g.id=o.group_id WHERE o.id=?', (object_id,))
+            if obj and obj['task_id'] == task['id'] and not future.done():
+                active = True
+        if active:
+            continue
+        for group in core.rows("SELECT * FROM groups WHERE task_id=? AND status NOT IN ('committed','empty','retired','cancelled')", (task['id'],)):
+            directory = Path(group['directory'])
+            if directory.exists():
+                core.owned_remove(directory, core.OUT)
+            scratch = core.WORK / task['id'] / group['id']
+            if scratch.exists():
+                core.owned_remove(scratch, core.WORK)
+            core.execute("UPDATE groups SET status='cancelled' WHERE id=?", (group['id'],))
+        with core.connect() as db:
+            db.execute("UPDATE scan SET offset=0,staged_parts='[]',text_content=NULL,sha256=NULL,state='pending' WHERE task_id=? AND state!='done'", (task['id'],))
+            if task['run_id']:
+                db.execute("UPDATE runs SET status='stopped',finished=? WHERE id=?", (core.now(), task['run_id']))
+            db.execute("UPDATE tasks SET cancel_requested=0,paused=0,operation=NULL,run_id=NULL,manual=0,status='scan_ready',error=NULL,updated=? WHERE id=?", (core.now(), task['id']))
+        core.log(task['id'], '已结束本次运行，当前已提交备份和NAS原始文件保持可用')
+
+
 def window(config=None, date=None) -> tuple[bool, str]:
     config = config or core.settings()
     date = date or datetime.now(TZ)
@@ -196,7 +221,7 @@ def apply_group(task: dict, group: dict):
                     if position != item['size']:
                         raise RuntimeError('文件长度不完整')
                     archive._record_file(db, task['id'], item, parts)
-                    db.execute("UPDATE scan SET state='done' WHERE task_id=? AND path=?", (task['id'], item['path']))
+                    db.execute("UPDATE scan SET state='done',text_content=NULL WHERE task_id=? AND path=?", (task['id'], item['path']))
                 except (OSError, RuntimeError) as error:
                     db.execute("UPDATE scan SET state='unstable',error=? WHERE task_id=? AND path=?", (core.redact(error), task['id'], item['path']))
 
@@ -313,11 +338,12 @@ def collect_unused_groups(task: dict, cloud: Cloud):
             references.update(p['group'] for p in json.loads(record['parts']))
         for record in db.execute("SELECT staged_parts FROM scan WHERE task_id=? AND state NOT IN ('done','unstable')", (task['id'],)):
             references.update(p['group'] for p in json.loads(record['staged_parts']))
-    for group in core.rows("SELECT * FROM groups WHERE task_id=? AND status='committed'", (task['id'],)):
+    for group in core.rows("SELECT * FROM groups WHERE task_id=? AND status IN ('committed','cancelled')", (task['id'],)):
         if group['id'] in references:
             continue
         try:
-            cloud.delete_owned_group(group['cloud_dest'], task['cloud_dest'] or core.one('SELECT cloud_dest FROM tasks WHERE id=?', (task['id'],))['cloud_dest'])
+            if group['cloud_dest']:
+                cloud.delete_owned_group(group['cloud_dest'], task['cloud_dest'] or core.one('SELECT cloud_dest FROM tasks WHERE id=?', (task['id'],))['cloud_dest'])
             core.execute("UPDATE groups SET status='retired' WHERE id=?", (group['id'],))
             core.log(task['id'], '已清理完全失去有效引用的旧数据组', run_id=task['run_id'])
         except Exception:
@@ -326,7 +352,7 @@ def collect_unused_groups(task: dict, cloud: Cloud):
 
 def one_group(task: dict):
     task_id = task['id']
-    group = core.one("SELECT * FROM groups WHERE task_id=? AND status NOT IN ('committed','empty','retired') ORDER BY created LIMIT 1", (task_id,))
+    group = core.one("SELECT * FROM groups WHERE task_id=? AND status NOT IN ('committed','empty','retired','cancelled') ORDER BY created LIMIT 1", (task_id,))
     if not group:
         archive.prepare_candidates(task, lambda: not allowed(task_id))
         if not allowed(task_id):
@@ -407,6 +433,13 @@ def loop():
     core.execute("UPDATE tasks SET status='queued' WHERE operation IS NOT NULL AND paused=0 AND status NOT IN ('error','scan_ready')")
     while not STOP.is_set():
         try:
+            settle_cancellations()
+            for waiting in core.rows("SELECT id FROM tasks WHERE status='space_wait' AND paused=0"):
+                try:
+                    archive.reserve_group()
+                    core.set_status(waiting['id'], 'queued')
+                except archive.Wait:
+                    pass
             schedule()
             tasks = core.rows("SELECT * FROM tasks WHERE operation IS NOT NULL AND paused=0 AND status NOT IN ('error','scan_ready','space_wait') ORDER BY updated")
             selected = next((t for t in tasks if t['operation'] == 'scan' or allowed(t['id'])), None)
