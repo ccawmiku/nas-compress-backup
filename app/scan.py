@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import stat as statmod
 import time
 from pathlib import Path
 
@@ -24,7 +25,9 @@ def compression(path: str) -> int:
 def excluded(path: Path, root: Path, patterns: list[str]) -> bool:
     if path.is_symlink() or path.name in IGNORE_DIRS or path.suffix.lower() in IGNORE_SUFFIXES:
         return True
-    absolute = str(path.resolve())
+    # Roots are resolved once; walked children cannot traverse symlink directories.
+    # Lexical absolute paths avoid resolving every ancestor for every file.
+    absolute = str(path.absolute())
     for directory in (core.HOST_DATA, core.HOST_WORK, core.HOST_OUT):
         if absolute == directory or absolute.startswith(directory.rstrip('/') + '/'):
             return True
@@ -67,11 +70,13 @@ def scan_task(task: dict, stopped=lambda: False) -> dict:
                     dirs[:] = sorted(d for d in dirs if not excluded(parent / d, root, patterns))
                     for name in sorted(files):
                         path = parent / name
-                        if excluded(path, root, patterns) or not path.is_file():
+                        if excluded(path, root, patterns):
                             continue
                         value = str(path)
                         stat = path.stat()
-                        old = db.execute('SELECT * FROM files WHERE task_id=? AND path=?', (task_id, value)).fetchone()
+                        if not statmod.S_ISREG(stat.st_mode):
+                            continue
+                        old = db.execute('SELECT present,cloud_state,size,mtime_ns,ctime_ns FROM files WHERE task_id=? AND path=?', (task_id, value)).fetchone()
                         kind = 'new' if old is None else ('unchanged' if old['present'] and old['cloud_state'] == 'ok' and (old['size'], old['mtime_ns'], old['ctime_ns']) ==
                                 (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) else 'modified')
                         state = 'done' if kind == 'unchanged' else 'pending'

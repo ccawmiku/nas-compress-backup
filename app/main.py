@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import secrets
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -49,7 +50,7 @@ def session_user(request: Request):
         return None
     digest = hashlib.sha256(token.encode()).hexdigest()
     session = core.one('SELECT * FROM sessions WHERE token=? AND expires>?', (digest, core.now()))
-    return core.one('SELECT username FROM admin WHERE id=1') if session else None
+    return core.one('SELECT id FROM admin WHERE id=1') if session else None
 
 
 @app.middleware('http')
@@ -114,19 +115,19 @@ def health():
 def auth_status(request: Request):
     user = session_user(request)
     return {'setup_required': core.one('SELECT id FROM admin WHERE id=1') is None,
-            'authenticated': bool(user), 'username': user['username'] if user else None}
+            'authenticated': bool(user)}
 
 
 @app.post('/api/auth/setup')
 def setup(body: dict, response: Response):
-    username, password = str(body.get('username', '')).strip(), str(body.get('password', ''))
-    if not username or len(username) > 80 or len(password) < 8:
-        raise HTTPException(400, '请填写用户名和至少8位密码')
+    password = str(body.get('password', ''))
+    if len(password) < 8:
+        raise HTTPException(400, '请填写至少8位管理密码')
     with core.connect() as db:
         db.execute('BEGIN IMMEDIATE')
         if db.execute('SELECT id FROM admin WHERE id=1').fetchone():
             raise HTTPException(409, '管理员已经创建')
-        db.execute('INSERT INTO admin VALUES (1,?,?)', (username, password_hash(password)))
+        db.execute('INSERT INTO admin VALUES (1,?,?)', ('admin', password_hash(password)))
     establish_session(response)
     return {'ok': True}
 
@@ -139,11 +140,10 @@ def login(body: dict, request: Request, response: Response):
         raise HTTPException(429, '尝试过于频繁，请稍后重试')
     user = core.one('SELECT * FROM admin WHERE id=1')
     supplied = str(body.get('password', ''))
-    valid = user and str(body.get('username', '')) == user['username']
-    valid = valid and hmac.compare_digest(password_hash(supplied, user['password'].split(':')[0]), user['password'])
+    valid = user and hmac.compare_digest(password_hash(supplied, user['password'].split(':')[0]), user['password'])
     if not valid:
         LOGIN_ATTEMPTS[host] = attempts + [core.now()]
-        raise HTTPException(401, '用户名或密码不正确')
+        raise HTTPException(401, '密码不正确')
     LOGIN_ATTEMPTS.pop(host, None)
     establish_session(response)
     return {'ok': True}
@@ -157,11 +157,25 @@ def logout(request: Request, response: Response):
     return {'ok': True}
 
 
-def task_view(task: dict):
-    result = dict(task)
-    for field in ('roots', 'excludes', 'progress'):
-        result[field] = json.loads(result[field])
-    result['progress'].update(LIVE.get(result['id'], {}))
+SNAPSHOTS = {}
+SNAPSHOT_LOCK = threading.RLock()
+
+
+def cached(key, ttl, build):
+    # Display snapshots only: archive space checks and source reads never use this cache.
+    with SNAPSHOT_LOCK:
+        existing = SNAPSHOTS.get(key)
+        if existing and time.monotonic() - existing[0] < ttl:
+            return existing[1]
+        value = build()
+        if len(SNAPSHOTS) >= 256:
+            SNAPSHOTS.pop(next(iter(SNAPSHOTS)))
+        SNAPSHOTS[key] = (time.monotonic(), value)
+        return value
+
+
+def task_statistics(task):
+    result = {}
     upload = core.one('''SELECT COALESCE(SUM(o.size),0) total,COALESCE(SUM(o.transferred),0) transferred,
        SUM(CASE WHEN o.status='uploaded' THEN 1 ELSE 0 END) done,COUNT(*) count
        FROM objects o JOIN groups g ON g.id=o.group_id WHERE g.task_id=? AND g.run_id=?''', (task['id'], task['run_id']))
@@ -171,8 +185,19 @@ def task_view(task: dict):
     result['files'] = core.one('SELECT COUNT(*) count,COALESCE(SUM(size),0) bytes,SUM(CASE WHEN present=0 THEN 1 ELSE 0 END) retained FROM files WHERE task_id=?', (task['id'],))
     run = core.one('SELECT started FROM runs WHERE id=?', (task['run_id'],)) if task['run_id'] else None
     result['run_started'] = run['started'] if run else None
+    return result
+
+
+def task_view(task: dict):
+    result = dict(task)
+    for field in ('roots', 'excludes', 'progress'):
+        result[field] = json.loads(result[field])
+    result['progress'].update(LIVE.get(result['id'], {}))
+    stamp = (str(core.DB), task['id'], task['run_id'], task['scan_id'], task['catalog_generation'], task['status'], task['last_success'])
+    result.update(cached(stamp, 3 if task['operation'] else 30, lambda: task_statistics(task)))
     values = core.get_secrets()
     custom = bool(values.get('task_password:' + task['id']))
+    result['next_run_at'] = worker.next_due(task) if task['auto'] and task['initialized'] else None
     result['encryption'] = {'enabled': True, 'algorithm': 'AES-256', 'file_names': True,
                             'mode': 'task' if custom else 'global',
                             'configured': bool(custom or values.get('archive_password')),
@@ -211,7 +236,7 @@ def set_task_encryption(task_id: str, body: dict, task: dict | None = None):
 def overview():
     config = core.settings()
     return {'tasks': [task_view(t) for t in core.rows('SELECT * FROM tasks ORDER BY created')],
-            'disk': {'used': core.disk_used(), 'quota': config['quota_gb'] * 1_000_000_000},
+            'disk': {'used': cached(('disk', str(core.WORK), str(core.OUT)), 5, core.disk_used), 'quota': config['quota_gb'] * 1_000_000_000},
             'night': {'start': config['night_start'], 'end': config['night_end'], 'inside': worker.window(config)[0]},
             'version': core.VERSION}
 
@@ -240,16 +265,19 @@ def task_values(body: dict):
         excludes = [p.strip() for p in excludes.splitlines() if p.strip()]
     if not isinstance(excludes, list) or len(excludes) > 100:
         raise ValueError('排除规则格式错误')
-    return name, roots, excludes, bool(body.get('auto', True))
+    interval = body.get('interval_days', 7)
+    if isinstance(interval, bool) or not isinstance(interval, int) or not 1 <= interval <= 3650:
+        raise ValueError('增量间隔必须是1至3650之间的整数天数')
+    return name, roots, excludes, bool(body.get('auto', True)), interval
 
 
 @app.post('/api/tasks')
 def create_task(body: dict):
-    name, roots, excludes, auto = task_values(body)
+    name, roots, excludes, auto, interval = task_values(body)
     task_id = core.identifier()
     set_task_encryption(task_id, body)
-    core.execute("INSERT INTO tasks(id,name,roots,excludes,auto,status,operation,created,updated) VALUES (?,?,?,?,?,'queued','scan',?,?)",
-                 (task_id, name, json.dumps(roots), json.dumps(excludes), int(auto), core.now(), core.now()))
+    core.execute("INSERT INTO tasks(id,name,roots,excludes,auto,interval_days,status,operation,created,updated) VALUES (?,?,?,?,?,?,'queued','scan',?,?)",
+                 (task_id, name, json.dumps(roots), json.dumps(excludes), int(auto), interval, core.now(), core.now()))
     worker.WAKE.set()
     return {'id': task_id}
 
@@ -257,16 +285,16 @@ def create_task(body: dict):
 @app.patch('/api/tasks/{task_id}')
 def update_task(task_id: str, body: dict):
     task = task_detail(task_id)
-    name, roots, excludes, auto = task_values(body)
-    if task['operation']:
-        if roots != task['roots'] or excludes != task['excludes']:
-            raise HTTPException(409, '请先结束本次运行，再修改来源目录或排除规则')
+    name, roots, excludes, auto, interval = task_values(body)
+    if roots == task['roots'] and excludes == task['excludes']:
         set_task_encryption(task_id, body, task)
-        core.execute('UPDATE tasks SET name=?,auto=?,updated=? WHERE id=?', (name, int(auto), core.now(), task_id))
+        core.execute('UPDATE tasks SET name=?,auto=?,interval_days=?,updated=? WHERE id=?', (name, int(auto), interval, core.now(), task_id))
         return {'ok': True}
+    if task['operation']:
+        raise HTTPException(409, '请先结束本次运行，再修改来源目录或排除规则')
     set_task_encryption(task_id, body, task)
-    core.execute('UPDATE tasks SET name=?,roots=?,excludes=?,auto=?,run_id=NULL,last_scan=NULL,status=?,updated=? WHERE id=?',
-                 (name, json.dumps(roots), json.dumps(excludes), int(auto), 'draft', core.now(), task_id))
+    core.execute('UPDATE tasks SET name=?,roots=?,excludes=?,auto=?,interval_days=?,run_id=NULL,last_scan=NULL,status=?,updated=? WHERE id=?',
+                 (name, json.dumps(roots), json.dumps(excludes), int(auto), interval, 'draft', core.now(), task_id))
     return {'ok': True}
 
 

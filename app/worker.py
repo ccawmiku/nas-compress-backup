@@ -325,8 +325,8 @@ def finish(task: dict):
     failed = core.one("SELECT COUNT(*) n FROM scan WHERE task_id=? AND state='unstable'", (task['id'],))['n']
     status = 'attention' if failed else 'complete'
     core.execute('UPDATE runs SET status=?,finished=?,summary=? WHERE id=?', (status, core.now(), json.dumps(summary(task['id'])), task['run_id']))
-    core.execute('UPDATE tasks SET status=?,operation=NULL,manual=0,last_success=CASE WHEN ?=0 THEN ? ELSE last_success END,updated=? WHERE id=?',
-                 (status, failed, core.now(), core.now(), task['id']))
+    core.execute('UPDATE tasks SET status=?,operation=NULL,manual=0,last_success=CASE WHEN ?=0 THEN ? ELSE last_success END,last_completed=?,updated=? WHERE id=?',
+                 (status, failed, core.now(), core.now(), core.now(), task['id']))
     core.progress(task['id'], 'complete', percent=100, current_path='')
     core.log(task['id'], f'本次运行结束，{failed} 个文件等待下次扫描' if failed else '本次运行完成，当前备份已更新', run_id=task['run_id'])
 
@@ -419,12 +419,18 @@ def start_run(task: dict):
     core.set_status(task['id'], 'queued')
 
 
+def next_due(task: dict) -> float | None:
+    completed = task.get('last_completed') or task.get('last_success')
+    return completed + task['interval_days'] * 86400 if completed else None
+
+
 def schedule():
     inside, key = window()
     if not inside or not core.settings()['auto_schedule']:
         return
     for task in core.rows("SELECT * FROM tasks WHERE auto=1 AND initialized=1 AND operation IS NULL AND paused=0 AND status IN ('complete','attention')"):
-        if task['last_window'] != key:
+        due = next_due(task)
+        if due is not None and core.now() >= due:
             core.execute("UPDATE tasks SET operation='backup',status='queued',manual=0,run_id=NULL,last_window=?,updated=? WHERE id=?", (key, core.now(), task['id']))
 
 

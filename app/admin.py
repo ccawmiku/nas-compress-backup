@@ -8,5 +8,5 @@ core.init()
 with core.connect() as db:
     db.execute('DELETE FROM sessions')
     db.execute('DELETE FROM admin')
-print('Administrator cleared. Open the LAN web page to set a new account. Backup data was preserved.')
+print('Administrator cleared. Open the LAN web page to set a new management password. Backup data was preserved.')
 

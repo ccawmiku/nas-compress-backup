@@ -13,7 +13,7 @@ from conftest import make_task
 def test_admin_secrets_and_same_origin(state):
     with TestClient(app) as client:
         assert client.get('/api/overview').status_code == 401
-        response = client.post('/api/auth/setup', json={'username': 'owner', 'password': 'testing-password'})
+        response = client.post('/api/auth/setup', json={'password': 'testing-password'})
         assert response.status_code == 200
         assert 'HttpOnly' in response.headers['set-cookie']
         assert client.post('/api/auth/setup', json={'username': 'second', 'password': 'testing-password'}).status_code == 409
@@ -27,6 +27,56 @@ def test_admin_secrets_and_same_origin(state):
         assert core.settings()['quota_gb'] == 128
         assert client.post('/api/auth/logout').status_code == 200
         assert client.get('/api/tasks/not-real').status_code == 401
+        assert client.post('/api/auth/login', json={'password': 'wrong-password'}).status_code == 401
+        # Existing username values are irrelevant after migration; retain the password.
+        core.execute("UPDATE admin SET username='old-user-name'")
+        assert client.post('/api/auth/login', json={'password': 'testing-password'}).status_code == 200
+        assert 'username' not in client.get('/api/auth/status').json()
+
+
+def test_independent_task_intervals_and_night_window(state, monkeypatch):
+    stamp = 2000000000
+    monkeypatch.setattr(core, 'now', lambda: stamp)
+    monkeypatch.setattr(worker, 'window', lambda: (True, 'night'))
+    first, second = make_task(state, None), make_task(state, None)
+    for task, days in ((first, 2), (second, 7)):
+        core.execute("UPDATE tasks SET initialized=1,status='complete',interval_days=?,last_completed=? WHERE id=?",
+                     (days, stamp - 3 * 86400, task['id']))
+    worker.schedule()
+    assert core.one('SELECT operation FROM tasks WHERE id=?', (first['id'],))['operation'] == 'backup'
+    assert core.one('SELECT operation FROM tasks WHERE id=?', (second['id'],))['operation'] is None
+    core.execute('UPDATE tasks SET last_completed=? WHERE id=?', (stamp - 8 * 86400, second['id']))
+    monkeypatch.setattr(worker, 'window', lambda: (False, ''))
+    worker.schedule()
+    assert core.one('SELECT operation FROM tasks WHERE id=?', (second['id'],))['operation'] is None
+    # Manual scans do not move the next due date; a completed manual backup does.
+    record = core.one('SELECT * FROM tasks WHERE id=?', (second['id'],))
+    assert worker.next_due(record) == stamp - 86400
+
+
+def test_interval_edit_keeps_completed_task_schedulable(state):
+    task = make_task(state, None)
+    core.execute("UPDATE tasks SET status='complete',initialized=1,last_completed=1000 WHERE id=?", (task['id'],))
+    with TestClient(app) as client:
+        client.post('/api/auth/setup', json={'password': 'testing-password'})
+        body = {'name': task['name'], 'roots': [str(state)], 'interval_days': 3}
+        assert client.patch('/api/tasks/' + task['id'], json=body).status_code == 200
+        current = client.get('/api/tasks/' + task['id']).json()
+        assert current['status'] == 'complete' and current['next_run_at'] == 1000 + 3 * 86400
+        for invalid in (0, -1, 1.5, True, 3651, '3'):
+            body['interval_days'] = invalid
+            assert client.patch('/api/tasks/' + task['id'], json=body).status_code == 400
+
+
+def test_legacy_schema_migrates_schedule_and_keeps_password(state):
+    task = make_task(state, None)
+    core.execute('UPDATE tasks SET last_success=1000 WHERE id=?', (task['id'],))
+    with core.connect() as db:
+        db.execute('ALTER TABLE tasks DROP COLUMN interval_days')
+        db.execute('ALTER TABLE tasks DROP COLUMN last_completed')
+    core.init()
+    current = core.one('SELECT * FROM tasks WHERE id=?', (task['id'],))
+    assert current['interval_days'] == 7 and current['last_completed'] == 1000
 
 
 def test_source_boundaries_and_initial_scan_only(state):

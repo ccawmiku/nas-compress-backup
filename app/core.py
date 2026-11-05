@@ -25,7 +25,7 @@ MAX_UPLOAD = int(os.getenv('NCB_MAX_UPLOAD_BYTES', '3900000000'))
 PACK_PAYLOAD = int(os.getenv('NCB_PACK_BYTES', '3700000000'))
 GROUP_PACKS = int(os.getenv('NCB_GROUP_PACKS', '5'))
 TEXT_LIMIT = 512 * 1024
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 
 DEFAULTS = {
     'night_start': '', 'night_end': '', 'quota_gb': 128,
@@ -61,6 +61,7 @@ def init():
           scan_id TEXT,error TEXT,catalog_generation INTEGER NOT NULL DEFAULT 0,
           cancel_requested INTEGER NOT NULL DEFAULT 0,
           cloud_cache_at REAL,
+          interval_days INTEGER NOT NULL DEFAULT 7,last_completed REAL,
           created REAL NOT NULL,updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS files(
           task_id TEXT NOT NULL,path TEXT NOT NULL,root TEXT,relative TEXT,size INTEGER,
@@ -103,9 +104,18 @@ def init():
             db.execute('ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0')
         if 'cloud_cache_at' not in task_columns:
             db.execute('ALTER TABLE tasks ADD COLUMN cloud_cache_at REAL')
+        if 'interval_days' not in task_columns:
+            db.execute('ALTER TABLE tasks ADD COLUMN interval_days INTEGER NOT NULL DEFAULT 7')
+        if 'last_completed' not in task_columns:
+            db.execute('ALTER TABLE tasks ADD COLUMN last_completed REAL')
+            db.execute("""UPDATE tasks SET last_completed=COALESCE(
+                (SELECT MAX(finished) FROM runs WHERE runs.task_id=tasks.id AND status IN ('complete','attention')),
+                last_success)""")
         file_columns = {r['name'] for r in db.execute('PRAGMA table_info(files)')}
         if 'cloud_state' not in file_columns:
             db.execute("ALTER TABLE files ADD COLUMN cloud_state TEXT NOT NULL DEFAULT 'ok'")
+        db.execute('CREATE INDEX IF NOT EXISTS file_content ON files(task_id,sha256,cloud_state)')
+        db.execute('CREATE INDEX IF NOT EXISTS run_tasks ON runs(task_id,started DESC)')
         for key, value in DEFAULTS.items():
             db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (key, json.dumps(value)))
         db.execute("INSERT OR IGNORE INTO settings VALUES ('text_cache_bytes','0')")

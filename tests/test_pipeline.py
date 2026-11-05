@@ -81,6 +81,8 @@ def test_bounded_fragment_pipeline_incremental_and_par2(state, monkeypatch, tmp_
     task = make_task(state)
     result = process(task)
     assert result['status'] == 'complete'
+    assert result['last_completed'] >= result['last_success']
+    assert worker.next_due(result) == result['last_completed'] + 7 * 86400
     files = core.rows('SELECT * FROM files WHERE task_id=?', (task['id'],))
     assert len(files) == 2
     record = next(f for f in files if f['path'] == str(large))

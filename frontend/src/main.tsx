@@ -67,6 +67,7 @@ const stages: Any = {
   upload: "上传到百度网盘",
   size_verify: "核对云端大小",
   index: "更新当前索引",
+  cloud_refresh: "刷新云端清单",
   complete: "处理完成",
 };
 const kinds: Any = {
@@ -190,8 +191,7 @@ function Modal({ title, children, close, wide = false }: any) {
 }
 
 function Auth({ status, done }: any) {
-  const [username, setUsername] = useState("admin"),
-    [password, setPassword] = useState(""),
+  const [password, setPassword] = useState(""),
     [again, setAgain] = useState(""),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false);
@@ -205,7 +205,6 @@ function Auth({ status, done }: any) {
     setBusy(true);
     try {
       await api(status.setup_required ? "/auth/setup" : "/auth/login", "POST", {
-        username,
         password,
       });
       done();
@@ -232,19 +231,9 @@ function Auth({ status, done }: any) {
           </div>
           <div className="divider my-0" />
           <h2 className="font-medium">
-            {status.setup_required ? "创建管理员" : "管理员登录"}
+            {status.setup_required ? "设置管理密码" : "密码登录"}
           </h2>
           <form onSubmit={submit} className="space-y-4">
-            <label className="form-control block">
-              <span className="label-text text-sm">用户名</span>
-              <input
-                className="input input-bordered w-full mt-1"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                autoComplete="username"
-                required
-              />
-            </label>
             <label className="block">
               <span className="text-sm">
                 密码{status.setup_required ? "（至少8位）" : ""}
@@ -387,6 +376,7 @@ function TaskEditor({ task, close, saved, report }: any) {
           name: task.name,
           roots: task.roots,
           auto: !!task.auto,
+          interval_days: task.interval_days || 7,
           excludes: task.excludes.join("\n"),
           encryption_mode: task.encryption?.mode || "global",
           encryption_password: "",
@@ -395,6 +385,7 @@ function TaskEditor({ task, close, saved, report }: any) {
           name: "",
           roots: [],
           auto: true,
+          interval_days: 7,
           excludes: "",
           encryption_mode: "global",
           encryption_password: "",
@@ -613,7 +604,30 @@ function TaskEditor({ task, close, saved, report }: any) {
                 checked={form.auto}
                 onChange={(e) => setForm({ ...form, auto: e.target.checked })}
               />
-              <span className="text-sm">首次手动开始后，每晚自动检查增量</span>
+              <span className="text-sm">启用本任务的定期增量备份</span>
+            </label>
+            <label className="block">
+              <span className="text-sm">增量间隔（天）</span>
+              <input
+                className="input input-bordered w-full mt-2"
+                type="number"
+                min={1}
+                max={3650}
+                step={1}
+                required
+                disabled={!form.auto}
+                value={form.interval_days}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    interval_days:
+                      e.target.value === "" ? "" : Number(e.target.value),
+                  })
+                }
+              />
+              <span className="text-xs text-base-content/55">
+                本任务每次备份结束后，再隔指定天数检查增量；到期后在设置的夜间窗口执行。首次备份仍需手动开始。
+              </span>
             </label>
             <div className="alert bg-base-200 text-sm">
               <Cloud size={18} />
@@ -1156,6 +1170,14 @@ function TaskOverview({ task }: any) {
           <div className="stat-desc">云端数量和大小核对，不下载回读</div>
         </div>
       </div>
+      <div className="alert bg-base-100 border border-base-300 text-sm">
+        <Moon size={18} />
+        <span>
+          {task.auto
+            ? `每 ${task.interval_days} 天检查增量 · ${task.next_run_at ? `下次到期 ${date(task.next_run_at)}，到期后在夜间窗口执行` : "首次备份完成后开始计时"}`
+            : "本任务仅手动运行"}
+        </span>
+      </div>
       <div className="card bg-base-100 border border-base-300">
         <div className="card-body p-5 gap-3">
           <h3 className="text-sm font-medium">来源与目标</h3>
@@ -1204,17 +1226,19 @@ function RunList({ taskId, report }: any) {
     [logs, setLogs] = useState<any[]>([]);
   useEffect(() => {
     const load = () =>
-      Promise.all([
-        api("/runs?task_id=" + (taskId || "")),
-        api("/logs?task_id=" + (taskId || "")),
-      ])
-        .then(([r, l]) => {
-          setRuns(r.items);
-          setLogs(l.items);
-        })
-        .catch((e: any) => report(e.message));
+      document.hidden
+        ? Promise.resolve()
+        : Promise.all([
+            api("/runs?task_id=" + (taskId || "")),
+            api("/logs?task_id=" + (taskId || "")),
+          ])
+            .then(([r, l]) => {
+              setRuns(r.items);
+              setLogs(l.items);
+            })
+            .catch((e: any) => report(e.message));
     load();
-    const id = setInterval(load, 5000);
+    const id = setInterval(load, 15000);
     return () => clearInterval(id);
   }, [taskId]);
   return (
@@ -1580,6 +1604,7 @@ function App() {
       const d = await api("/overview");
       setData(d);
       lastError.current = "";
+      return d;
     } catch (e: any) {
       if (e.status === 401) checkAuth();
       else if (lastError.current !== e.message) {
@@ -1597,9 +1622,36 @@ function App() {
   }, [dark]);
   useEffect(() => {
     if (!auth?.authenticated) return;
-    refresh();
-    const id = setInterval(refresh, 2000);
-    return () => clearInterval(id);
+    let stopped = false,
+      busy = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      if (stopped || busy) return;
+      busy = true;
+      let delay = 15000;
+      try {
+        if (!document.hidden) {
+          const d = await refresh();
+          if (d?.tasks.some((t: Any) => t.operation)) delay = 3000;
+        }
+      } finally {
+        busy = false;
+        if (!stopped) timer = setTimeout(poll, delay);
+      }
+    };
+    const visible = () => {
+      if (!document.hidden && !busy) {
+        clearTimeout(timer);
+        void poll();
+      }
+    };
+    void poll();
+    document.addEventListener("visibilitychange", visible);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", visible);
+    };
   }, [auth?.authenticated]);
   async function action(id: string, verb: string) {
     try {
@@ -1711,7 +1763,7 @@ function App() {
                     <Badge value={task.status} />
                     {!!task.auto && (
                       <span className="text-xs text-base-content/50">
-                        夜间自动增量
+                        每 {task.interval_days} 天增量 · 夜间执行
                       </span>
                     )}
                   </div>
