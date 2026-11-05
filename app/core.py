@@ -60,11 +60,13 @@ def init():
           progress TEXT NOT NULL DEFAULT '{}',last_scan REAL,last_success REAL,last_window TEXT,
           scan_id TEXT,error TEXT,catalog_generation INTEGER NOT NULL DEFAULT 0,
           cancel_requested INTEGER NOT NULL DEFAULT 0,
+          cloud_cache_at REAL,
           created REAL NOT NULL,updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS files(
           task_id TEXT NOT NULL,path TEXT NOT NULL,root TEXT,relative TEXT,size INTEGER,
           mtime_ns INTEGER,ctime_ns INTEGER,sha256 TEXT,parts TEXT NOT NULL DEFAULT '[]',
           present INTEGER NOT NULL DEFAULT 1,backed_up REAL,text_content TEXT,
+          cloud_state TEXT NOT NULL DEFAULT 'ok',
           PRIMARY KEY(task_id,path));
         CREATE TABLE IF NOT EXISTS scan(
           task_id TEXT NOT NULL,path TEXT NOT NULL,root TEXT,relative TEXT,size INTEGER,
@@ -99,6 +101,11 @@ def init():
         task_columns = {r['name'] for r in db.execute('PRAGMA table_info(tasks)')}
         if 'cancel_requested' not in task_columns:
             db.execute('ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0')
+        if 'cloud_cache_at' not in task_columns:
+            db.execute('ALTER TABLE tasks ADD COLUMN cloud_cache_at REAL')
+        file_columns = {r['name'] for r in db.execute('PRAGMA table_info(files)')}
+        if 'cloud_state' not in file_columns:
+            db.execute("ALTER TABLE files ADD COLUMN cloud_state TEXT NOT NULL DEFAULT 'ok'")
         for key, value in DEFAULTS.items():
             db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (key, json.dumps(value)))
         db.execute("INSERT OR IGNORE INTO settings VALUES ('text_cache_bytes','0')")

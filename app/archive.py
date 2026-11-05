@@ -23,8 +23,10 @@ class SourceChanged(RuntimeError):
     pass
 
 
-def password() -> str:
-    value = core.get_secrets().get('archive_password', '')
+def password(task_id: str | None = None) -> str:
+    values = core.get_secrets()
+    value = values.get('task_password:' + task_id, '') if task_id else ''
+    value = value or values.get('archive_password', '')
     if not value:
         raise RuntimeError('请先设置归档密码')
     return value
@@ -54,7 +56,7 @@ def tool(command: list[str], task_id: str, stage: str, cwd=None):
 
 
 def seven(verb: str, archive: Path, task_id: str, extra=(), cwd=None, stage='pack'):
-    tool([os.getenv('NCB_7ZZ', '7zz'), verb, '-y', '-bb0', '-bsp1', '-p' + password(),
+    tool([os.getenv('NCB_7ZZ', '7zz'), verb, '-y', '-bb0', '-bsp1', '-p' + password(task_id),
           str(archive), *extra], task_id, stage, cwd)
 
 
@@ -104,8 +106,8 @@ def _record_file(db, task_id: str, item: dict, parts: list):
 
 def resolve_reuse(task: dict, item: dict) -> bool:
     current = core.one('SELECT * FROM files WHERE task_id=? AND path=?', (task['id'], item['path']))
-    existing = current if current and current['sha256'] == item['sha256'] else core.one(
-        'SELECT * FROM files WHERE task_id=? AND sha256=? LIMIT 1', (task['id'], item['sha256']))
+    existing = current if current and current['cloud_state'] == 'ok' and current['sha256'] == item['sha256'] else core.one(
+        "SELECT * FROM files WHERE task_id=? AND sha256=? AND cloud_state='ok' LIMIT 1", (task['id'], item['sha256']))
     if not existing:
         return False
     deleted = core.one("SELECT * FROM scan WHERE task_id=? AND path=? AND kind='deleted'", (task['id'], existing['path']))

@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from . import core
 from .cloud import Cloud, CloudError, pb
 from .scan import LIVE, excluded
-from . import worker
+from . import worker, archive
 
 LOGIN_ATTEMPTS = {}
 
@@ -171,7 +171,40 @@ def task_view(task: dict):
     result['files'] = core.one('SELECT COUNT(*) count,COALESCE(SUM(size),0) bytes,SUM(CASE WHEN present=0 THEN 1 ELSE 0 END) retained FROM files WHERE task_id=?', (task['id'],))
     run = core.one('SELECT started FROM runs WHERE id=?', (task['run_id'],)) if task['run_id'] else None
     result['run_started'] = run['started'] if run else None
+    values = core.get_secrets()
+    custom = bool(values.get('task_password:' + task['id']))
+    result['encryption'] = {'enabled': True, 'algorithm': 'AES-256', 'file_names': True,
+                            'mode': 'task' if custom else 'global',
+                            'configured': bool(custom or values.get('archive_password')),
+                            'locked': encryption_locked(task)}
     return result
+
+
+def encryption_locked(task: dict) -> bool:
+    return task.get('operation') == 'backup' or bool(core.one('SELECT id FROM groups WHERE task_id=? LIMIT 1', (task['id'],)))
+
+
+def set_task_encryption(task_id: str, body: dict, task: dict | None = None):
+    values = core.get_secrets()
+    key = 'task_password:' + task_id
+    current = 'task' if values.get(key) else 'global'
+    mode = body.get('encryption_mode', current)
+    supplied = str(body.get('encryption_password', ''))
+    if mode not in ('global', 'task'):
+        raise ValueError('加密密码模式无效')
+    if mode == current and not supplied:
+        return
+    if task and encryption_locked(task):
+        raise HTTPException(409, '任务正在备份或已有归档，不能更换该任务的加密密码')
+    if mode == 'task':
+        if not supplied and not values.get(key):
+            raise ValueError('请填写任务单独使用的加密密码')
+        if supplied and len(supplied) < 8:
+            raise ValueError('任务加密密码至少8位')
+        if supplied:
+            core.save_secrets({key: supplied})
+    else:
+        core.save_secrets({key: ''})
 
 
 @app.get('/api/overview')
@@ -214,6 +247,7 @@ def task_values(body: dict):
 def create_task(body: dict):
     name, roots, excludes, auto = task_values(body)
     task_id = core.identifier()
+    set_task_encryption(task_id, body)
     core.execute("INSERT INTO tasks(id,name,roots,excludes,auto,status,operation,created,updated) VALUES (?,?,?,?,?,'queued','scan',?,?)",
                  (task_id, name, json.dumps(roots), json.dumps(excludes), int(auto), core.now(), core.now()))
     worker.WAKE.set()
@@ -227,8 +261,10 @@ def update_task(task_id: str, body: dict):
     if task['operation']:
         if roots != task['roots'] or excludes != task['excludes']:
             raise HTTPException(409, '请先结束本次运行，再修改来源目录或排除规则')
+        set_task_encryption(task_id, body, task)
         core.execute('UPDATE tasks SET name=?,auto=?,updated=? WHERE id=?', (name, int(auto), core.now(), task_id))
         return {'ok': True}
+    set_task_encryption(task_id, body, task)
     core.execute('UPDATE tasks SET name=?,roots=?,excludes=?,auto=?,run_id=NULL,last_scan=NULL,status=?,updated=? WHERE id=?',
                  (name, json.dumps(roots), json.dumps(excludes), int(auto), 'draft', core.now(), task_id))
     return {'ok': True}
@@ -259,7 +295,9 @@ def task_action(task_id: str, action: str):
     task = core.one('SELECT * FROM tasks WHERE id=?', (task_id,))
     if not task:
         raise HTTPException(404, '任务不存在')
-    if action == 'cancel':
+    if action == 'refresh-cloud':
+        return refresh_cloud_cache(task)
+    elif action == 'cancel':
         core.execute("UPDATE tasks SET paused=1,cancel_requested=1,status='pausing',updated=? WHERE id=?", (core.now(), task_id))
     elif action == 'pause':
         core.execute("UPDATE tasks SET paused=1,status='pausing',updated=? WHERE id=?", (core.now(), task_id))
@@ -269,8 +307,11 @@ def task_action(task_id: str, action: str):
     elif action in ('scan', 'run'):
         if task['operation']:
             raise HTTPException(409, '已有运行中的任务，请先继续或暂停该任务')
-        if action == 'run' and not core.get_secrets().get('archive_password'):
-            raise HTTPException(400, '请先配置归档密码')
+        if action == 'run':
+            try:
+                archive.password(task_id)
+            except RuntimeError:
+                raise HTTPException(400, '请先为任务配置加密密码，或在设置中填写默认归档密码')
         inside, key = worker.window()
         core.execute('UPDATE tasks SET operation=?,status=?,run_id=NULL,paused=0,manual=?,last_window=?,error=NULL,updated=? WHERE id=?',
                      ('scan' if action == 'scan' else 'backup', 'queued', int(action == 'run'), key if inside else task['last_window'], core.now(), task_id))
@@ -278,6 +319,49 @@ def task_action(task_id: str, action: str):
         raise HTTPException(404, '不支持的操作')
     worker.WAKE.set()
     return {'ok': True}
+
+
+def refresh_cloud_cache(task: dict):
+    if task['operation']:
+        raise HTTPException(409, '当前任务结束后再手动刷新云端清单；运行中的上传会自行核对大小')
+    cached = core.rows('SELECT path,parts FROM files WHERE task_id=?', (task['id'],))
+    if not task['cloud_dest']:
+        return {'ok': True, 'groups': 0, 'abnormal_files': 0, 'message': '尚未创建云端仓库，本次按首次备份处理'}
+    group_ids = {part['group'] for f in cached for part in json.loads(f['parts'])}
+    states = {}
+    cloud = Cloud()
+    try:
+        for index, group_id in enumerate(sorted(group_ids)):
+            path = task['cloud_dest'].rstrip('/') + '/groups/' + group_id
+            objects = core.rows('SELECT name,size,kind FROM objects WHERE group_id=?', (group_id,))
+            try:
+                remote = {f.name: f.size for f in cloud.files(path, True) if not f.isDirectory}
+            except CloudError as error:
+                if 'NOT_FOUND' not in str(error):
+                    raise
+                remote = {}
+            missing_data = {o['name'] for o in objects if o['kind'] == 'data' and remote.get(o['name']) != o['size']}
+            missing_protection = any(remote.get(o['name']) != o['size'] for o in objects if o['kind'] != 'data')
+            states[group_id] = (missing_data, missing_protection)
+            core.progress(task['id'], 'cloud_refresh', percent=(index + 1) / max(len(group_ids), 1) * 100)
+    finally:
+        cloud.close()
+    abnormal = 0
+    with core.connect() as db:
+        for item in cached:
+            state = 'ok'
+            for part in json.loads(item['parts']):
+                data, protection = states.get(part['group'], (set(), False))
+                if any(v in data for v in part['volumes']):
+                    state = 'missing'
+                    break
+                if protection:
+                    state = 'protection_missing'
+            abnormal += state != 'ok'
+            db.execute('UPDATE files SET cloud_state=? WHERE task_id=? AND path=?', (state, task['id'], item['path']))
+        db.execute('UPDATE tasks SET cloud_cache_at=? WHERE id=?', (core.now(), task['id']))
+    core.log(task['id'], f'已刷新云端目录元数据：{len(group_ids)} 个组，{abnormal} 个文件需处理；未下载原始文件')
+    return {'ok': True, 'groups': len(group_ids), 'abnormal_files': abnormal, 'downloaded_original_files': False}
 
 
 @app.get('/api/browse')
@@ -352,7 +436,7 @@ def files(task_id: str, page: int = 1, search: str = ''):
         where += ' AND path LIKE ?'
         args.append('%' + search[:200] + '%')
     total = core.one('SELECT COUNT(*) n FROM files WHERE ' + where, args)['n']
-    items = core.rows('SELECT path,root,relative,size,sha256,present,backed_up,parts FROM files WHERE ' + where + ' ORDER BY path LIMIT 100 OFFSET ?', args + [max(0, page - 1) * 100])
+    items = core.rows('SELECT path,root,relative,size,sha256,present,backed_up,parts,cloud_state FROM files WHERE ' + where + ' ORDER BY path LIMIT 100 OFFSET ?', args + [max(0, page - 1) * 100])
     for item in items:
         item['parts'] = json.loads(item['parts'])
     return {'items': items, 'total': total, 'page': page, 'page_size': 100}

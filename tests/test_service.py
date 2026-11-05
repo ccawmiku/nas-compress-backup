@@ -107,3 +107,64 @@ def test_night_window_validation_and_numeric_settings(state):
         assert client.put('/api/settings', json={'night_start': '22:00', 'night_end': '22:00'}).status_code == 400
         assert client.put('/api/settings', json={'quota_gb': '128'}).status_code == 200
         assert core.settings()['quota_gb'] == 128
+
+
+def test_task_encryption_is_private_and_locked_after_archiving(state):
+    from app import archive
+    with TestClient(app) as client:
+        client.post('/api/auth/setup', json={'username': 'owner', 'password': 'testing-password'})
+        body = {'name': '独立加密', 'roots': [str(state)], 'encryption_mode': 'task',
+                'encryption_password': 'different-fixture-password'}
+        task_id = client.post('/api/tasks', json=body).json()['id']
+        detail = client.get('/api/tasks/' + task_id).json()
+        assert detail['encryption']['mode'] == 'task'
+        assert detail['encryption']['configured']
+        assert body['encryption_password'] not in json.dumps(detail)
+        assert archive.password(task_id) == body['encryption_password']
+        assert archive.password() == 'fixture-password-only'
+        core.execute("INSERT INTO groups(id,task_id,status,directory,created) VALUES ('locked',?,'committed','unused',?)",
+                     (task_id, core.now()))
+        body['encryption_password'] = 'replacement-fixture-password'
+        assert client.patch('/api/tasks/' + task_id, json=body).status_code == 409
+        assert archive.password(task_id) == 'different-fixture-password'
+
+
+def test_cloud_manifest_cache_reads_offline_and_refreshes_metadata_only(state, monkeypatch):
+    from importlib import import_module
+    from types import SimpleNamespace
+    main = import_module('app.main')
+    task = make_task(state, operation=None)
+    source = state / 'cached.txt'
+    source.write_text('new\n', encoding='utf-8')
+    size, mtime, ctime = core.signature(source)
+    parts = json.dumps([{'group': 'cached-group', 'volumes': ['data.7z']}])
+    core.execute('''INSERT INTO files(task_id,path,root,relative,size,mtime_ns,ctime_ns,parts,text_content)
+                    VALUES (?,?,?,?,?,?,?,?,?)''',
+                 (task['id'], str(source), str(state), source.name, size, mtime, ctime, parts, 'old\n'))
+    core.execute("UPDATE tasks SET cloud_dest='/bd/fixture-task' WHERE id=?", (task['id'],))
+    core.execute("INSERT INTO objects(id,group_id,name,size,kind) VALUES ('data','cached-group','data.7z',42,'data')")
+    core.execute("INSERT INTO objects(id,group_id,name,size,kind) VALUES ('parity','cached-group','recovery.par2',20,'parity')")
+    calls = []
+    class MetadataOnlyCloud:
+        def __init__(self):
+            calls.append('connect')
+        def files(self, path, refresh=False):
+            calls.append((path, refresh))
+            return [SimpleNamespace(name='recovery.par2', size=20, isDirectory=False)]
+        def close(self):
+            calls.append('close')
+    monkeypatch.setattr(main, 'Cloud', MetadataOnlyCloud)
+    assert scan_task(task) == {'unchanged': 1}
+    with TestClient(app) as client:
+        client.post('/api/auth/setup', json={'username': 'owner', 'password': 'testing-password'})
+        for _ in range(2):
+            assert client.get(f"/api/tasks/{task['id']}/files").json()['total'] == 1
+            assert client.get(f"/api/tasks/{task['id']}/changes").status_code == 200
+            assert client.get(f"/api/tasks/{task['id']}/diff", params={'path': str(source)}).json()['text_available']
+        assert calls == []
+        result = client.post(f"/api/tasks/{task['id']}/refresh-cloud").json()
+        assert result['abnormal_files'] == 1 and not result['downloaded_original_files']
+        assert calls == ['connect', ('/bd/fixture-task/groups/cached-group', True), 'close']
+        assert core.one('SELECT cloud_state FROM files')['cloud_state'] == 'missing'
+        assert core.one('SELECT cloud_cache_at FROM tasks')['cloud_cache_at']
+        assert scan_task(core.one('SELECT * FROM tasks')) == {'modified': 1}

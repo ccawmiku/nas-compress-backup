@@ -278,7 +278,7 @@ def publish_catalog(task: dict, cloud: Cloud):
         'objects': [{'name': p.name, 'size': p.stat().st_size, 'sha256': core.digest_file(p)} for p in files]}), encoding='utf-8')
     source = core.settings()['local_source'].rstrip('/') + '/nas-compress-backup/' + task['id'] + '/' + slot + '/' + marker.name
     wait_copy(cloud, source, dest, {marker.name: marker.stat().st_size}, overwrite=True)
-    core.execute('UPDATE tasks SET catalog_generation=? WHERE id=?', (generation, task['id']))
+    core.execute('UPDATE tasks SET catalog_generation=?,cloud_cache_at=? WHERE id=?', (generation, core.now(), task['id']))
     core.progress(task['id'], 'index', catalog_dirty=False)
     core.owned_remove(staging, core.WORK)
     core.owned_remove(directory, core.OUT)

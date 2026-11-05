@@ -374,6 +374,13 @@ function FolderPicker({ selected, choose, close, report }: any) {
 
 function TaskEditor({ task, close, saved, report }: any) {
   const [deleting, setDeleting] = useState(false);
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [globalPassword, setGlobalPassword] = useState(false);
+  useEffect(() => {
+    api("/settings")
+      .then((s) => setGlobalPassword(s.has_archive_password))
+      .catch((e: any) => report(e.message));
+  }, []);
   const [form, setForm] = useState<Any>(
     task
       ? {
@@ -381,13 +388,29 @@ function TaskEditor({ task, close, saved, report }: any) {
           roots: task.roots,
           auto: !!task.auto,
           excludes: task.excludes.join("\n"),
+          encryption_mode: task.encryption?.mode || "global",
+          encryption_password: "",
         }
-      : { name: "", roots: [], auto: true, excludes: "" },
+      : {
+          name: "",
+          roots: [],
+          auto: true,
+          excludes: "",
+          encryption_mode: "global",
+          encryption_password: "",
+        },
   );
   const [picker, setPicker] = useState(false),
     [busy, setBusy] = useState(false);
   async function save(e: React.FormEvent) {
     e.preventDefault();
+    if (
+      form.encryption_mode === "task" &&
+      form.encryption_password !== confirmPassword
+    ) {
+      report("两次任务加密密码不一致");
+      return;
+    }
     setBusy(true);
     try {
       const r = await api(
@@ -483,6 +506,94 @@ function TaskEditor({ task, close, saved, report }: any) {
                 )}
               </div>
             </div>
+            <fieldset className="fieldset border border-base-300 bg-base-200 rounded-box p-4 gap-3">
+              <legend className="fieldset-legend gap-2">
+                <ShieldCheck size={16} />
+                压缩包加密
+              </legend>
+              <div className="flex gap-2 flex-wrap">
+                <span className="badge badge-success badge-sm whitespace-nowrap">
+                  AES-256 内容加密
+                </span>
+                <span className="badge badge-outline badge-sm whitespace-nowrap">
+                  文件名也加密
+                </span>
+              </div>
+              <label className="block">
+                <span className="text-sm">密码来源</span>
+                <select
+                  className="select select-bordered w-full mt-2"
+                  value={form.encryption_mode}
+                  disabled={!!task?.encryption?.locked}
+                  onChange={(e) => {
+                    setForm({
+                      ...form,
+                      encryption_mode: e.target.value,
+                      encryption_password: "",
+                    });
+                    setConfirmPassword("");
+                  }}
+                >
+                  <option value="global">使用设置中的默认归档密码</option>
+                  <option value="task">为这个任务单独设置密码</option>
+                </select>
+              </label>
+              {form.encryption_mode === "global" ? (
+                <p
+                  className={`text-xs ${globalPassword ? "text-success" : "text-warning"}`}
+                >
+                  {globalPassword
+                    ? "默认密码已配置，创建任务时不需要重复输入。"
+                    : "默认密码尚未配置。可以先扫描，开始上传前请在设置中填写密码。"}
+                </p>
+              ) : (
+                <div className="grid sm:grid-cols-2 gap-3">
+                  <label className="block">
+                    <span className="text-sm">任务加密密码</span>
+                    <input
+                      className="input input-bordered w-full mt-2"
+                      type="password"
+                      autoComplete="new-password"
+                      minLength={8}
+                      disabled={!!task?.encryption?.locked}
+                      required={
+                        !task?.encryption?.configured ||
+                        task?.encryption?.mode !== "task"
+                      }
+                      placeholder={
+                        task?.encryption?.mode === "task"
+                          ? "已配置，留空保持不变"
+                          : "至少8位"
+                      }
+                      value={form.encryption_password}
+                      onChange={(e) =>
+                        setForm({
+                          ...form,
+                          encryption_password: e.target.value,
+                        })
+                      }
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-sm">再次输入密码</span>
+                    <input
+                      className="input input-bordered w-full mt-2"
+                      type="password"
+                      autoComplete="new-password"
+                      disabled={!!task?.encryption?.locked}
+                      required={!!form.encryption_password}
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                    />
+                  </label>
+                </div>
+              )}
+              <p className="text-xs text-base-content/55">
+                {task?.encryption?.locked
+                  ? "已有归档或正在备份，密码已锁定，避免旧包无法解密。"
+                  : "密码只保存在 NAS 的受保护配置中，上传的压缩包和索引里不保存密码。"}
+              </p>
+            </fieldset>
             <label className="block">
               <span className="text-sm font-medium">额外排除规则</span>
               <textarea
@@ -697,6 +808,7 @@ function FileLocations({ task, path, close, report }: any) {
 }
 
 function FileTable({ task, type, report, revision }: any) {
+  const [cloudBusy, setCloudBusy] = useState(false);
   const [data, setData] = useState<Any>({ items: [], total: 0 }),
     [page, setPage] = useState(1),
     [query, setQuery] = useState(""),
@@ -725,6 +837,38 @@ function FileTable({ task, type, report, revision }: any) {
   }, [task.id, type, page, query, filter, revision]);
   return (
     <>
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4 text-xs text-base-content/60">
+        <span>
+          比较依据：本地缓存的已备份文件清单 · 确认时间{" "}
+          {date(task.cloud_cache_at)}
+        </span>
+        <button
+          className="btn btn-ghost btn-xs gap-1"
+          disabled={cloudBusy || !!task.operation}
+          onClick={async () => {
+            setCloudBusy(true);
+            try {
+              const r = await api(`/tasks/${task.id}/refresh-cloud`, "POST");
+              await load();
+              if (r.abnormal_files)
+                report(
+                  `云端清单已刷新，${r.abnormal_files} 个文件需要处理；重新扫描可安排补传。`,
+                );
+            } catch (e: any) {
+              report(e.message);
+            } finally {
+              setCloudBusy(false);
+            }
+          }}
+        >
+          {cloudBusy ? (
+            <span className="loading loading-spinner loading-xs" />
+          ) : (
+            <Cloud size={13} />
+          )}
+          刷新云端清单
+        </button>
+      </div>
       <div className="flex items-center flex-wrap justify-between gap-3 mb-4">
         <label className="input input-bordered input-sm flex items-center gap-2 w-full sm:w-80">
           <Search size={15} />
@@ -797,9 +941,15 @@ function FileTable({ task, type, report, revision }: any) {
                     </span>
                   ) : (
                     <span
-                      className={`badge badge-sm whitespace-nowrap ${f.present ? "badge-success badge-outline" : "badge-neutral badge-outline"}`}
+                      className={`badge badge-sm whitespace-nowrap ${f.cloud_state && f.cloud_state !== "ok" ? "badge-warning" : f.present ? "badge-success badge-outline" : "badge-neutral badge-outline"}`}
                     >
-                      {f.present ? "源仍在" : "仅网盘保留"}
+                      {f.cloud_state === "missing"
+                        ? "云端缺失"
+                        : f.cloud_state === "protection_missing"
+                          ? "冗余不完整"
+                          : f.present
+                            ? "源仍在"
+                            : "仅网盘保留"}
                     </span>
                   )}
                 </td>
@@ -1009,6 +1159,22 @@ function TaskOverview({ task }: any) {
       <div className="card bg-base-100 border border-base-300">
         <div className="card-body p-5 gap-3">
           <h3 className="text-sm font-medium">来源与目标</h3>
+          <div className="flex items-center gap-2 flex-wrap text-xs">
+            <ShieldCheck size={15} className="text-success" />
+            <span
+              className={`badge badge-sm whitespace-nowrap ${task.encryption?.configured ? "badge-success badge-outline" : "badge-warning"}`}
+            >
+              {task.encryption?.configured
+                ? "AES-256 加密已配置"
+                : "需要设置加密密码"}
+            </span>
+            <span className="text-base-content/55">
+              内容与文件名加密 ·{" "}
+              {task.encryption?.mode === "task"
+                ? "任务单独密码"
+                : "默认归档密码"}
+            </span>
+          </div>
           {task.roots.map((r: string) => (
             <div className="flex items-start gap-2 text-sm" key={r}>
               <Folder
@@ -1597,6 +1763,7 @@ function App() {
                     <IconButton
                       icon={Play}
                       primary
+                      disabled={task.encryption?.configured === false}
                       onClick={() => action(task.id, "run")}
                     >
                       立即运行

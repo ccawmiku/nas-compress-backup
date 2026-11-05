@@ -97,6 +97,10 @@ def test_bounded_fragment_pipeline_incremental_and_par2(state, monkeypatch, tmp_
         prefix = '/bd/群晖压缩备份/' + task['id'] + '/groups/' + part['group'] + '/'
         pack = extracted / part['archive']
         pack.write_bytes(FakeCloud.remote[prefix + part['archive']])
+        if not restored:
+            wrong = subprocess.run([os.getenv('NCB_7ZZ', '7zz'), 'l', '-pwrong-fixture-password', str(pack)], capture_output=True)
+            assert wrong.returncode != 0
+            assert part['entry'].encode() not in wrong.stdout
         run = subprocess.run([os.getenv('NCB_7ZZ', '7zz'), 'x', '-so', '-pfixture-password-only', str(pack), part['entry']], capture_output=True)
         assert run.returncode == 0
         restored.extend(run.stdout)
