@@ -26,7 +26,7 @@ PACK_PAYLOAD = int(os.getenv('NCB_PACK_BYTES', '3700000000'))
 GROUP_PACKS = int(os.getenv('NCB_GROUP_PACKS', '5'))
 PACK_FILES = 4096
 TEXT_LIMIT = 512 * 1024
-VERSION = '0.2.2'
+VERSION = '0.2.3'
 
 DEFAULTS = {
     'night_start': '', 'night_end': '', 'quota_gb': 128,
@@ -117,6 +117,16 @@ def init():
             db.execute("ALTER TABLE files ADD COLUMN cloud_state TEXT NOT NULL DEFAULT 'ok'")
         db.execute('CREATE INDEX IF NOT EXISTS file_content ON files(task_id,sha256,cloud_state)')
         db.execute('CREATE INDEX IF NOT EXISTS run_tasks ON runs(task_id,started DESC)')
+        db.execute('CREATE TABLE IF NOT EXISTS file_before AS SELECT * FROM files WHERE 0')
+        db.execute('CREATE UNIQUE INDEX IF NOT EXISTS file_before_path ON file_before(task_id,path)')
+        db.execute('CREATE TABLE IF NOT EXISTS file_edits(task_id TEXT,path TEXT,PRIMARY KEY(task_id,path))')
+        db.execute('''CREATE TABLE IF NOT EXISTS publications(
+          task_id TEXT PRIMARY KEY,generation INTEGER,group_id TEXT,directory TEXT,staging TEXT,
+          destination TEXT,objects TEXT)''')
+        db.execute('''CREATE VIEW IF NOT EXISTS files_current AS
+          SELECT f.* FROM files f WHERE NOT EXISTS
+            (SELECT 1 FROM file_edits e WHERE e.task_id=f.task_id AND e.path=f.path)
+          UNION ALL SELECT * FROM file_before''')
         for key, value in DEFAULTS.items():
             db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (key, json.dumps(value)))
         db.execute("INSERT OR IGNORE INTO settings VALUES ('text_cache_bytes','0')")
@@ -128,6 +138,7 @@ def connect():
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA journal_mode=WAL')
     db.execute('PRAGMA busy_timeout=30000')
+    db.execute('PRAGMA synchronous=FULL')
     try:
         yield db
         db.commit()
@@ -214,6 +225,41 @@ def set_status(task_id: str, status: str, error=None):
 
 def identifier() -> str:
     return secrets.token_hex(12)
+
+
+def journal_file(db, task_id, path):
+    db.execute('''INSERT OR IGNORE INTO file_before SELECT * FROM files f WHERE task_id=? AND path=?
+      AND NOT EXISTS (SELECT 1 FROM file_edits e WHERE e.task_id=f.task_id AND e.path=f.path)''', (task_id,path))
+    db.execute('INSERT OR IGNORE INTO file_edits VALUES (?,?)', (task_id,path))
+
+
+def commit_files(db, task_id):
+    db.execute('DELETE FROM file_before WHERE task_id=?', (task_id,))
+    db.execute('DELETE FROM file_edits WHERE task_id=?', (task_id,))
+
+
+def rollback_files(db, task_id):
+    db.execute('''DELETE FROM files WHERE task_id=? AND path IN
+      (SELECT path FROM file_edits WHERE task_id=?)''', (task_id,task_id))
+    db.execute('INSERT INTO files SELECT * FROM file_before WHERE task_id=?', (task_id,))
+    commit_files(db, task_id)
+    total = db.execute('SELECT COALESCE(SUM(length(CAST(text_content AS BLOB))),0) n FROM files').fetchone()['n']
+    db.execute("UPDATE settings SET value=? WHERE key='text_cache_bytes'", (str(total),))
+
+
+def sync_files(paths):
+    for path in paths:
+        with Path(path).open('r+b') as source:
+            os.fsync(source.fileno())
+    if os.name == 'posix':
+        # Persist file entries, newly created group directories and their task parent.
+        parents = {parent for p in paths for parent in list(Path(p).parents)[:3]}
+        for parent in parents:
+            fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
 
 def digest_file(path: Path) -> str:

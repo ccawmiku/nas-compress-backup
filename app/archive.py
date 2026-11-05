@@ -92,6 +92,7 @@ def create_group(task: dict) -> dict:
 
 
 def _record_file(db, task_id: str, item: dict, parts: list):
+    core.journal_file(db, task_id, item['path'])
     old = db.execute('SELECT text_content FROM files WHERE task_id=? AND path=?', (task_id, item['path'])).fetchone()
     old_bytes = len((old['text_content'] or '').encode()) if old else 0
     value = item.get('text_content')
@@ -115,6 +116,7 @@ def resolve_reuse(task: dict, item: dict) -> bool:
     with core.connect() as db:
         _record_file(db, task['id'], item, json.loads(existing['parts']))
         if deleted and existing['path'] != item['path']:
+            core.journal_file(db, task['id'], existing['path'])
             db.execute('DELETE FROM files WHERE task_id=? AND path=?', (task['id'], existing['path']))
             cached = int(json.loads(db.execute("SELECT value FROM settings WHERE key='text_cache_bytes'").fetchone()['value']))
             db.execute("UPDATE settings SET value=? WHERE key='text_cache_bytes'", (str(max(0, cached - len((existing.get('text_content') or '').encode()))),))
@@ -242,6 +244,7 @@ def build_pack(task: dict, group: dict) -> bool:
     seven('t', volumes[0], task_id, stage='local_verify')
     if any(v.stat().st_size > core.MAX_UPLOAD for v in volumes):
         raise RuntimeError('压缩包超过3900MB限制')
+    core.sync_files(volumes)
     object_rows = [(core.identifier(), group['id'], v.name, v.stat().st_size, core.digest_file(v), 'data') for v in volumes]
     with core.connect() as db:
         db.executemany('INSERT INTO objects(id,group_id,name,size,sha256,kind) VALUES (?,?,?,?,?,?)', object_rows)
@@ -303,6 +306,7 @@ def close_group(task: dict, group: dict):
     outputs = extra + sorted(directory.glob('recovery*.par2'))
     if any(p.stat().st_size > core.MAX_UPLOAD for p in outputs):
         raise RuntimeError('冗余文件超过3900MB限制')
+    core.sync_files(outputs)
     with core.connect() as db:
         db.execute("DELETE FROM objects WHERE group_id=? AND kind!='data'", (group['id'],))
         for path in outputs:

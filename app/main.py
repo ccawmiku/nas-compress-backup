@@ -182,7 +182,7 @@ def task_statistics(task):
     result['upload'] = upload
     result['scan_summary'] = worker.summary(task['id'])
     result['processed'] = core.one("SELECT COUNT(*) count,COALESCE(SUM(size),0) bytes FROM scan WHERE task_id=? AND state='done' AND kind NOT IN ('unchanged','moved_from')", (task['id'],))
-    result['files'] = core.one('SELECT COUNT(*) count,COALESCE(SUM(size),0) bytes,SUM(CASE WHEN present=0 THEN 1 ELSE 0 END) retained FROM files WHERE task_id=?', (task['id'],))
+    result['files'] = core.one('SELECT COUNT(*) count,COALESCE(SUM(size),0) bytes,SUM(CASE WHEN present=0 THEN 1 ELSE 0 END) retained FROM files_current WHERE task_id=?', (task['id'],))
     run = core.one('SELECT started FROM runs WHERE id=?', (task['run_id'],)) if task['run_id'] else None
     result['run_started'] = run['started'] if run else None
     return result
@@ -241,7 +241,8 @@ def overview():
     config = core.settings()
     return {'tasks': [task_view(t) for t in core.rows('SELECT * FROM tasks ORDER BY created')],
             'disk': {'used': cached(('disk', str(core.WORK), str(core.OUT)), 5, core.disk_used), 'quota': config['quota_gb'] * 1_000_000_000},
-            'night': {'start': config['night_start'], 'end': config['night_end'], 'inside': worker.window(config)[0]},
+            'night': {'start': config['night_start'], 'end': config['night_end'], 'inside': worker.window(config)[0],
+                      'enabled': config['auto_schedule'], 'timezone': 'Asia/Shanghai'},
             'version': core.VERSION}
 
 
@@ -312,7 +313,7 @@ def delete_task(task_id: str):
         for group_id in group_ids:
             db.execute('DELETE FROM members WHERE group_id=?', (group_id,))
             db.execute('DELETE FROM objects WHERE group_id=?', (group_id,))
-        for table in ('groups', 'scan', 'files', 'runs', 'logs'):
+        for table in ('groups', 'scan', 'files', 'file_before', 'file_edits', 'publications', 'runs', 'logs'):
             db.execute(f'DELETE FROM {table} WHERE task_id=?', (task_id,))
         db.execute('DELETE FROM tasks WHERE id=?', (task_id,))
     for parent in (core.WORK, core.OUT):
@@ -330,6 +331,8 @@ def task_action(task_id: str, action: str):
     if action == 'refresh-cloud':
         return refresh_cloud_cache(task)
     elif action == 'cancel':
+        if core.one('SELECT task_id FROM publications WHERE task_id=?', (task_id,)):
+            raise HTTPException(409,'索引提交正在确认或等待对账，请先重试；确认后可安全结束本次运行')
         core.execute("UPDATE tasks SET paused=1,cancel_requested=1,status='pausing',updated=? WHERE id=?", (core.now(), task_id))
     elif action == 'pause':
         core.execute("UPDATE tasks SET paused=1,status='pausing',updated=? WHERE id=?", (core.now(), task_id))
@@ -360,7 +363,7 @@ def task_action(task_id: str, action: str):
 def refresh_cloud_cache(task: dict):
     if task['operation']:
         raise HTTPException(409, '当前任务结束后再手动刷新云端清单；运行中的上传会自行核对大小')
-    cached = core.rows('SELECT path,parts FROM files WHERE task_id=?', (task['id'],))
+    cached = core.rows('SELECT path,parts FROM files_current WHERE task_id=?', (task['id'],))
     if not task['cloud_dest']:
         return {'ok': True, 'groups': 0, 'abnormal_files': 0, 'message': '尚未创建云端仓库，本次按首次备份处理'}
     group_ids = {part['group'] for f in cached for part in json.loads(f['parts'])}
@@ -445,7 +448,7 @@ def diff(task_id: str, path: str):
     item = core.one('SELECT * FROM scan WHERE task_id=? AND path=?', (task_id, path))
     if not item:
         raise HTTPException(404, '文件不存在于当前扫描中')
-    old = core.one('SELECT * FROM files WHERE task_id=? AND path=?', (task_id, path))
+    old = core.one('SELECT * FROM files_current WHERE task_id=? AND path=?', (task_id, path))
     new = None
     source = core.permitted(path)
     if source.is_file() and source.stat().st_size <= core.TEXT_LIMIT:
@@ -471,8 +474,8 @@ def files(task_id: str, page: int = 1, search: str = ''):
     if search:
         where += ' AND path LIKE ?'
         args.append('%' + search[:200] + '%')
-    total = core.one('SELECT COUNT(*) n FROM files WHERE ' + where, args)['n']
-    items = core.rows('SELECT path,root,relative,size,sha256,present,backed_up,parts,cloud_state FROM files WHERE ' + where + ' ORDER BY path LIMIT 100 OFFSET ?', args + [max(0, page - 1) * 100])
+    total = core.one('SELECT COUNT(*) n FROM files_current WHERE ' + where, args)['n']
+    items = core.rows('SELECT path,root,relative,size,sha256,present,backed_up,parts,cloud_state FROM files_current WHERE ' + where + ' ORDER BY path LIMIT 100 OFFSET ?', args + [max(0, page - 1) * 100])
     for item in items:
         item['parts'] = json.loads(item['parts'])
     return {'items': items, 'total': total, 'page': page, 'page_size': 100}
@@ -481,7 +484,7 @@ def files(task_id: str, page: int = 1, search: str = ''):
 @app.get('/api/tasks/{task_id}/locations')
 def locations(task_id: str, path: str):
     task = core.one('SELECT * FROM tasks WHERE id=?', (task_id,))
-    item = core.one('SELECT * FROM files WHERE task_id=? AND path=?', (task_id, path))
+    item = core.one('SELECT * FROM files_current WHERE task_id=? AND path=?', (task_id, path))
     if not task or not item:
         raise HTTPException(404, '当前备份中没有此文件')
     parts = json.loads(item['parts'])

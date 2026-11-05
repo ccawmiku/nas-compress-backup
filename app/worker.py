@@ -26,6 +26,8 @@ ACTIVE_TASK = None
 
 def settle_cancellations():
     for task in core.rows('SELECT * FROM tasks WHERE cancel_requested=1'):
+        if core.one('SELECT task_id FROM publications WHERE task_id=?', (task['id'],)):
+            continue
         active = False
         for object_id, future in list(FUTURES.items()):
             obj = core.one('SELECT g.task_id FROM objects o JOIN groups g ON g.id=o.group_id WHERE o.id=?', (object_id,))
@@ -42,6 +44,7 @@ def settle_cancellations():
                 core.owned_remove(scratch, core.WORK)
             core.execute("UPDATE groups SET status='cancelled' WHERE id=?", (group['id'],))
         with core.connect() as db:
+            core.rollback_files(db, task['id'])
             db.execute("UPDATE scan SET offset=0,staged_parts='[]',text_content=NULL,sha256=NULL,state='pending' WHERE task_id=? AND state!='done'", (task['id'],))
             if task['run_id']:
                 db.execute("UPDATE runs SET status='stopped',finished=? WHERE id=?", (core.now(), task['run_id']))
@@ -229,14 +232,17 @@ def apply_group(task: dict, group: dict):
 
 def apply_deletions(task_id: str):
     with core.connect() as db:
+        for row in db.execute("SELECT path FROM files WHERE task_id=? AND present=1 AND path IN (SELECT path FROM scan WHERE task_id=? AND kind='deleted')", (task_id,task_id)):
+            core.journal_file(db, task_id, row['path'])
         db.execute("UPDATE files SET present=0 WHERE task_id=? AND path IN (SELECT path FROM scan WHERE task_id=? AND kind='deleted')", (task_id, task_id))
         db.execute("UPDATE scan SET state='done' WHERE task_id=? AND kind='deleted'", (task_id,))
         db.execute("UPDATE files SET present=1 WHERE task_id=? AND path IN (SELECT path FROM scan WHERE task_id=? AND kind='unchanged')", (task_id, task_id))
 
 
-def publish_catalog(task: dict, cloud: Cloud):
+def publish_catalog(task: dict, cloud: Cloud, group_id=None):
     task = core.one('SELECT * FROM tasks WHERE id=?', (task['id'],))
     generation = task['catalog_generation'] + 1
+    publication = str(generation) + '-' + core.identifier()
     slot = 'catalog-' + ('a' if generation % 2 else 'b')
     directory = core.OUT / task['id'] / slot
     if directory.exists():
@@ -260,29 +266,70 @@ def publish_catalog(task: dict, cloud: Cloud):
             item['parts'] = json.loads(item['parts'])
             json.dump(item, out, ensure_ascii=False)
         out.write(']}')
-    archive.seven('a', directory / 'current-index.7z', task['id'],
+    archive_name = 'current-index-' + publication + '.7z'
+    archive.seven('a', directory / archive_name, task['id'],
                   ['-t7z', '-mhe=on', '-mx=3', '-mmt=1', '-v%db' % core.MAX_UPLOAD, metadata.name], cwd=staging, stage='index')
-    volumes = sorted(directory.glob('current-index.7z.*'))
+    volumes = sorted(directory.glob(archive_name + '.*'))
     if len(volumes) == 1:
-        os.replace(volumes[0], directory / 'current-index.7z')
+        os.replace(volumes[0], directory / archive_name)
     files = sorted(p for p in directory.iterdir() if p.is_file())
     archive.seven('t', files[0], task['id'], stage='local_verify')
     if any(p.stat().st_size > core.MAX_UPLOAD for p in files):
         raise RuntimeError('索引超过单文件大小限制')
+    core.sync_files(files)
     dest = cloud.ensure_folder(cloud.task_destination(task), slot)
-    for path in files:
-        source = core.settings()['local_source'].rstrip('/') + '/nas-compress-backup/' + task['id'] + '/' + slot + '/' + path.name
-        wait_copy(cloud, source, dest, {path.name: path.stat().st_size}, overwrite=True)
     # A tiny slot marker is uploaded last and binds a generation to exact encrypted objects.
-    marker = directory / 'catalog.json'
+    marker = directory / ('catalog-' + publication + '.json')
     marker.write_text(json.dumps({'format': 1, 'generation': generation,
         'objects': [{'name': p.name, 'size': p.stat().st_size, 'sha256': core.digest_file(p)} for p in files]}), encoding='utf-8')
-    source = core.settings()['local_source'].rstrip('/') + '/nas-compress-backup/' + task['id'] + '/' + slot + '/' + marker.name
-    wait_copy(cloud, source, dest, {marker.name: marker.stat().st_size}, overwrite=True)
-    core.execute('UPDATE tasks SET catalog_generation=?,cloud_cache_at=? WHERE id=?', (generation, core.now(), task['id']))
-    core.progress(task['id'], 'index', catalog_dirty=False)
-    core.owned_remove(staging, core.WORK)
-    core.owned_remove(directory, core.OUT)
+    core.sync_files([marker])
+    objects = [{'name': p.name,'size':p.stat().st_size} for p in [*files,marker]]
+    core.execute('INSERT INTO publications VALUES (?,?,?,?,?,?,?)',
+                 (task['id'],generation,group_id,str(directory),str(staging),dest,json.dumps(objects)))
+    complete_publication(core.one('SELECT * FROM publications WHERE task_id=?', (task['id'],)),cloud)
+
+
+def complete_publication(publication, cloud):
+    task_id = publication['task_id']
+    task = core.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+    directory,staging = Path(publication['directory']),Path(publication['staging'])
+    objects = json.loads(publication['objects'])
+    # The immutable receipt is last. A persisted intent allows restart to finish
+    # the identical publication instead of abandoning a possibly committed receipt.
+    for obj in objects:
+        source = core.settings()['local_source'].rstrip('/') + '/nas-compress-backup/' + task_id + '/' + directory.name + '/' + obj['name']
+        core.progress(task_id,'commit',current_path=obj['name'],percent=None,phase_bytes=0,phase_total=obj['size'])
+        wait_copy(cloud,source,publication['destination'],{obj['name']:obj['size']},
+                  on_progress=lambda value: core.progress(task_id,'commit',phase_bytes=value,percent=100*value/max(obj['size'],1)))
+    with core.connect() as db:
+        core.commit_files(db,task_id)
+        db.execute('UPDATE tasks SET catalog_generation=?,cloud_cache_at=? WHERE id=?', (publication['generation'],core.now(),task_id))
+        if publication['group_id']:
+            db.execute("UPDATE groups SET status='committed' WHERE id=?", (publication['group_id'],))
+        db.execute('DELETE FROM publications WHERE task_id=?', (task_id,))
+    core.progress(task_id,'index',catalog_dirty=False)
+    for path,parent in ((staging,core.WORK),(directory,core.OUT)):
+        if path.exists():
+            core.owned_remove(path,parent)
+    if publication['group_id']:
+        group = core.one('SELECT directory FROM groups WHERE id=?', (publication['group_id'],))
+        for path,parent in ((Path(group['directory']),core.OUT),(core.WORK/task_id/publication['group_id'],core.WORK)):
+            if path.exists():
+                core.owned_remove(path,parent)
+    try:
+        cloud.prune_catalog(publication['destination'],{o['name'] for o in objects},task['cloud_dest'] or cloud.task_destination(task))
+    except Exception:
+        core.log(task_id,'当前索引已提交；旧索引残留将在后续写入同一槽位时清理','warning')
+
+
+def recover_publications():
+    for publication in core.rows('SELECT * FROM publications'):
+        cloud = Cloud()
+        try:
+            complete_publication(publication,cloud)
+            core.log(publication['task_id'],'已完成中断前的索引提交对账')
+        finally:
+            cloud.close()
 
 
 def commit_group(task: dict, group: dict):
@@ -297,8 +344,7 @@ def commit_group(task: dict, group: dict):
         core.progress(task['id'], 'size_verify', percent=100)
         apply_group(task, group)
         apply_deletions(task['id'])
-        publish_catalog(task, cloud)
-        core.execute("UPDATE groups SET status='committed' WHERE id=?", (group['id'],))
+        publish_catalog(task, cloud, group['id'])
         core.owned_remove(Path(group['directory']), core.OUT)
         scratch = core.WORK / task['id'] / group['id']
         if scratch.exists():
@@ -458,10 +504,15 @@ def schedule():
 
 def loop():
     global ACTIVE_TASK
+    for group in core.rows("SELECT task_id,id,directory FROM groups WHERE status='committed'"):
+        for path,parent in ((Path(group['directory']),core.OUT), (core.WORK/group['task_id']/group['id'],core.WORK)):
+            if path.exists():
+                core.owned_remove(path,parent)
     core.execute("UPDATE objects SET status='ready' WHERE status='uploading'")
     core.execute("UPDATE tasks SET status='queued' WHERE operation IS NOT NULL AND paused=0 AND status NOT IN ('error','scan_ready')")
     while not STOP.is_set():
         try:
+            recover_publications()
             settle_cancellations()
             for waiting in core.rows("SELECT id FROM tasks WHERE status='space_wait' AND paused=0"):
                 try:

@@ -140,3 +140,13 @@ class Cloud:
     def download_info(self, path: str):
         return self.call('GetDownloadUrlPath', pb.GetDownloadUrlPathRequest(
             path=path, preview=False, lazy_read=False, get_direct_url=False))
+
+    def prune_catalog(self, path: str, keep: set[str], task_dest: str):
+        if path not in {task_dest.rstrip('/') + '/catalog-a', task_dest.rstrip('/') + '/catalog-b'}:
+            raise CloudError('拒绝清理任务索引槽之外的路径')
+        pattern = r'(?:current-index(?:-\d+-[0-9a-f]{24})?\.7z(?:\.\d+)?|catalog(?:-\d+-[0-9a-f]{24})?\.json)'
+        for item in self.files(path, True):
+            if not item.isDirectory and item.name not in keep and re.fullmatch(pattern,item.name):
+                result = self.call('DeleteFile', pb.FileRequest(path=path+'/'+item.name))
+                if not result.success:
+                    raise CloudError('旧索引清理未完成')

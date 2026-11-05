@@ -76,7 +76,7 @@ def scan_task(task: dict, stopped=lambda: False) -> dict:
                         stat = path.stat()
                         if not statmod.S_ISREG(stat.st_mode):
                             continue
-                        old = db.execute('SELECT present,cloud_state,size,mtime_ns,ctime_ns FROM files WHERE task_id=? AND path=?', (task_id, value)).fetchone()
+                        old = db.execute('SELECT present,cloud_state,size,mtime_ns,ctime_ns FROM files_current WHERE task_id=? AND path=?', (task_id, value)).fetchone()
                         kind = 'new' if old is None else ('unchanged' if old['present'] and old['cloud_state'] == 'ok' and (old['size'], old['mtime_ns'], old['ctime_ns']) ==
                                 (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) else 'modified')
                         state = 'done' if kind == 'unchanged' else 'pending'
@@ -96,7 +96,7 @@ def scan_task(task: dict, stopped=lambda: False) -> dict:
             db.execute('DELETE FROM scan WHERE task_id=?', (task_id,))
             db.execute(f'INSERT INTO scan SELECT * FROM {table}')
             db.execute('''INSERT INTO scan(task_id,path,root,relative,size,mtime_ns,ctime_ns,kind,state,sha256)
-              SELECT task_id,path,root,relative,size,mtime_ns,ctime_ns,'deleted','pending',sha256 FROM files
+              SELECT task_id,path,root,relative,size,mtime_ns,ctime_ns,'deleted','pending',sha256 FROM files_current
               WHERE task_id=? AND present=1 AND path NOT IN (SELECT path FROM scan WHERE task_id=?)''', (task_id, task_id))
             summary = {r['kind']: r['n'] for r in db.execute('SELECT kind,COUNT(*) n FROM scan WHERE task_id=? GROUP BY kind', (task_id,))}
             db.execute(f'DROP TABLE {table}')

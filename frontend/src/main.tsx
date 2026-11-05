@@ -39,7 +39,12 @@ const size = (n = 0) => {
   return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
 };
 const date = (n?: number) =>
-  n ? new Date(n * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
+  n
+    ? new Date(n * 1000).toLocaleString("zh-CN", {
+        hour12: false,
+        timeZone: "Asia/Shanghai",
+      })
+    : "—";
 const states: Any = {
   draft: "等待扫描",
   queued: "等待处理",
@@ -68,6 +73,7 @@ const stages: Any = {
   upload: "上传到百度网盘",
   size_verify: "核对云端大小",
   index: "更新当前索引",
+  commit: "确认索引提交",
   cloud_refresh: "刷新云端清单",
   complete: "处理完成",
 };
@@ -1742,7 +1748,7 @@ function App() {
             </div>
           </div>
           <span className="badge badge-ghost badge-sm hidden sm:inline-flex">
-            局域网
+            局域网 · 北京时间
           </span>
           <button
             className="btn btn-ghost btn-sm btn-square"
@@ -1763,6 +1769,20 @@ function App() {
           </button>
         </header>
         <main className="p-4 lg:p-7 w-full max-w-screen-2xl mx-auto">
+          {page !== "settings" && data.night.enabled === false && (
+            <div className="alert alert-warning mb-5 text-sm">
+              <Moon size={18} />
+              <span>
+                全局自动调度已关闭，到夜间也不会自动开始。暂停的任务需要单独点“继续”。所有时间均为北京时间。
+              </span>
+              <button
+                className="btn btn-sm"
+                onClick={() => navigate("settings")}
+              >
+                去设置
+              </button>
+            </div>
+          )}
           {page === "settings" ? (
             <SettingsPage report={report} notify={notify} changed={refresh} />
           ) : page === "runs" ? (
@@ -1965,7 +1985,9 @@ function App() {
                           {t.last_success
                             ? new Date(
                                 t.last_success * 1000,
-                              ).toLocaleDateString("zh-CN")
+                              ).toLocaleDateString("zh-CN", {
+                                timeZone: "Asia/Shanghai",
+                              })
                             : "—"}
                         </span>
                       </div>
