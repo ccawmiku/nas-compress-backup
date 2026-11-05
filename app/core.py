@@ -25,7 +25,7 @@ MAX_UPLOAD = int(os.getenv('NCB_MAX_UPLOAD_BYTES', '3900000000'))
 PACK_PAYLOAD = int(os.getenv('NCB_PACK_BYTES', '3700000000'))
 GROUP_PACKS = int(os.getenv('NCB_GROUP_PACKS', '5'))
 TEXT_LIMIT = 512 * 1024
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 
 DEFAULTS = {
     'night_start': '', 'night_end': '', 'quota_gb': 128,

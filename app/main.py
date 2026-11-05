@@ -193,11 +193,15 @@ def task_view(task: dict):
     for field in ('roots', 'excludes', 'progress'):
         result[field] = json.loads(result[field])
     result['progress'].update(LIVE.get(result['id'], {}))
+    if worker.ACTIVE_TASK == task['id'] and task['operation'] == 'backup' and result['status'] == 'queued':
+        result['status'] = 'running'
     stamp = (str(core.DB), task['id'], task['run_id'], task['scan_id'], task['catalog_generation'], task['status'], task['last_success'])
     result.update(cached(stamp, 3 if task['operation'] else 30, lambda: task_statistics(task)))
     values = core.get_secrets()
     custom = bool(values.get('task_password:' + task['id']))
     result['next_run_at'] = worker.next_due(task) if task['auto'] and task['initialized'] else None
+    active = core.one('SELECT name,progress FROM tasks WHERE id=?', (worker.ACTIVE_TASK,)) if worker.ACTIVE_TASK and worker.ACTIVE_TASK != task['id'] else None
+    result['waiting_for'] = active['name'] if active and task['operation'] and task['status'] == 'queued' else None
     result['encryption'] = {'enabled': True, 'algorithm': 'AES-256', 'file_names': True,
                             'mode': 'task' if custom else 'global',
                             'configured': bool(custom or values.get('archive_password')),
@@ -341,6 +345,10 @@ def task_action(task_id: str, action: str):
             except RuntimeError:
                 raise HTTPException(400, '请先为任务配置加密密码，或在设置中填写默认归档密码')
         inside, key = worker.window()
+        reuse = (action == 'run' and task['status'] == 'scan_ready'
+                 and json.loads(task['progress']).get('stage') == 'scan_complete')
+        core.progress(task_id, 'queued', percent=None, current_path='', phase_bytes=0, phase_total=0,
+                      reuse_scan_id=task['scan_id'] if reuse else None, scan_run_id=None)
         core.execute('UPDATE tasks SET operation=?,status=?,run_id=NULL,paused=0,manual=?,last_window=?,error=NULL,updated=? WHERE id=?',
                      ('scan' if action == 'scan' else 'backup', 'queued', int(action == 'run'), key if inside else task['last_window'], core.now(), task_id))
     else:

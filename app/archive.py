@@ -33,6 +33,7 @@ def password(task_id: str | None = None) -> str:
 
 
 def tool(command: list[str], task_id: str, stage: str, cwd=None):
+    core.set_status(task_id, 'running')
     if os.name == 'posix' and shutil.which('nice'):
         command = ['nice', '-n', '10', *command]
     proc = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

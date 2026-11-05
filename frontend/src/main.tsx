@@ -56,6 +56,7 @@ const states: Any = {
   stopped: "已结束",
 };
 const stages: Any = {
+  queued: "已加入队列，等待开始",
   scan: "扫描目录",
   scan_complete: "扫描完成",
   hash: "读取与识别变化",
@@ -1075,7 +1076,9 @@ function TaskOverview({ task }: any) {
                 ) : (
                   <ShieldCheck size={18} className="text-primary" />
                 )}
-                {stages[p.stage] || states[task.status]}
+                {task.status === "queued"
+                  ? "等待处理"
+                  : stages[p.stage] || states[task.status]}
               </h3>
               <div className="text-xs text-base-content/55 mt-1">
                 {task.manual && task.operation === "backup"
@@ -1085,6 +1088,16 @@ function TaskOverview({ task }: any) {
             </div>
             <Badge value={task.status} />
           </div>
+          {task.status === "queued" && task.operation && (
+            <div className="alert bg-base-200 mt-4 text-sm">
+              <Loader2 size={18} className="animate-spin" />
+              <span>
+                {task.waiting_for
+                  ? `正在等待“${task.waiting_for}”完成当前处理批次，随后轮到本任务。当前尚未压缩。`
+                  : "任务已加入队列，即将开始检查文件。进入压缩后会显示“压缩与加密”及进度。"}
+              </span>
+            </div>
+          )}
           <div className="mt-5 space-y-5">
             {task.status === "scanning" ? (
               <Phase

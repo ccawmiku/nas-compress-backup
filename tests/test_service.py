@@ -79,6 +79,62 @@ def test_legacy_schema_migrates_schedule_and_keeps_password(state):
     assert current['interval_days'] == 7 and current['last_completed'] == 1000
 
 
+def test_run_reuses_recent_reviewed_scan_once_and_clears_old_progress(state, monkeypatch):
+    task = make_task(state, None)
+    (state / 'file.txt').write_text('fixture', encoding='utf-8')
+    scan_task(task)
+    core.execute("UPDATE tasks SET status='scan_ready' WHERE id=?", (task['id'],))
+    with TestClient(app) as client:
+        client.post('/api/auth/setup', json={'password': 'testing-password'})
+        assert client.post(f"/api/tasks/{task['id']}/run").status_code == 200
+    current = core.one('SELECT * FROM tasks WHERE id=?', (task['id'],))
+    assert json.loads(current['progress'])['stage'] == 'queued'
+    assert json.loads(current['progress'])['percent'] is None
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError('Recent reviewed scan must not run again')
+    monkeypatch.setattr(worker, 'scan_task', unexpected_scan)
+    worker.start_run(current)
+    current = core.one('SELECT * FROM tasks WHERE id=?', (task['id'],))
+    worker.ensure_run_scan(current)
+    assert json.loads(current['progress'])['scan_run_id'] == current['run_id']
+
+
+def test_old_reviewed_scan_is_refreshed_and_queue_names_active_task(state, monkeypatch):
+    from importlib import import_module
+    main = import_module('app.main')
+    task = make_task(state, None)
+    core.execute("UPDATE tasks SET status='scan_ready',last_scan=?,scan_id='old' WHERE id=?", (core.now() - 600, task['id']))
+    core.progress(task['id'], 'scan_complete')
+    with TestClient(app) as client:
+        client.post('/api/auth/setup', json={'password': 'testing-password'})
+        client.post(f"/api/tasks/{task['id']}/run")
+        calls = []
+        monkeypatch.setattr(worker, 'scan_task', lambda *args: calls.append('scan'))
+        worker.start_run(core.one('SELECT * FROM tasks WHERE id=?', (task['id'],)))
+        assert calls == ['scan']
+        active = make_task(state)
+        monkeypatch.setattr(worker, 'ACTIVE_TASK', active['id'])
+        assert client.get(f"/api/tasks/{task['id']}").json()['waiting_for'] == active['name']
+
+
+def test_upgrade_preserves_running_scan_and_shows_active_work(state, monkeypatch):
+    from importlib import import_module
+    main = import_module('app.main')
+    task = make_task(state)
+    core.execute("INSERT INTO runs(id,task_id,started,status) VALUES ('legacy-run',?,10,'running')", (task['id'],))
+    core.execute("UPDATE tasks SET run_id='legacy-run',last_scan=20 WHERE id=?", (task['id'],))
+    core.progress(task['id'], 'pack', percent=26)
+    def unexpected(*args):
+        raise AssertionError('Upgrade must preserve the scan and staged fragment state')
+    monkeypatch.setattr(worker, 'scan_task', unexpected)
+    current = core.one('SELECT * FROM tasks WHERE id=?', (task['id'],))
+    worker.ensure_run_scan(current)
+    monkeypatch.setattr(worker, 'ACTIVE_TASK', task['id'])
+    view = main.task_view(core.one('SELECT * FROM tasks WHERE id=?', (task['id'],)))
+    assert view['status'] == 'running' and view['progress']['stage'] == 'pack'
+    assert view['progress']['percent'] == 26
+
+
 def test_source_boundaries_and_initial_scan_only(state):
     (state / 'folder').mkdir()
     with TestClient(app) as client:

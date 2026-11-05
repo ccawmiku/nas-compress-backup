@@ -1,10 +1,11 @@
 services:
   nas-compress-backup:
-    image: ghcr.io/ccawmiku/nas-compress-backup:0.2.0
+    image: ghcr.io/ccawmiku/nas-compress-backup:0.2.1
     container_name: nas-compress-backup
     init: true
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "19800:19880"
     mem_limit: 1536m
     cpu_shares: 256
     environment:
@@ -26,4 +27,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-

@@ -21,6 +21,7 @@ WAKE = threading.Event()
 STOP = threading.Event()
 UPLOADS = ThreadPoolExecutor(max_workers=2, thread_name_prefix='cloud-upload')
 FUTURES = {}
+ACTIVE_TASK = None
 
 
 def settle_cancellations():
@@ -352,6 +353,7 @@ def collect_unused_groups(task: dict, cloud: Cloud):
 
 def one_group(task: dict):
     task_id = task['id']
+    core.set_status(task_id, 'running')
     group = core.one("SELECT * FROM groups WHERE task_id=? AND status NOT IN ('committed','empty','retired','cancelled') ORDER BY created LIMIT 1", (task_id,))
     if not group:
         archive.prepare_candidates(task, lambda: not allowed(task_id))
@@ -414,9 +416,29 @@ def start_run(task: dict):
     core.execute('INSERT INTO runs(id,task_id,started,status) VALUES (?,?,?,?)', (run_id, task['id'], core.now(), 'running'))
     core.execute('UPDATE tasks SET run_id=?,initialized=1 WHERE id=?', (run_id, task['id']))
     task['run_id'] = run_id
-    scan_task(task, lambda: STOP.is_set() or bool(core.one('SELECT paused FROM tasks WHERE id=?', (task['id'],))['paused']))
-    core.progress(task['id'], 'scan_complete', catalog_dirty=any(k != 'unchanged' and v for k, v in summary(task['id']).items()))
+    ensure_run_scan(task)
     core.set_status(task['id'], 'queued')
+
+
+def ensure_run_scan(task: dict):
+    progress = json.loads(core.one('SELECT progress FROM tasks WHERE id=?', (task['id'],))['progress'])
+    if progress.get('scan_run_id') == task['run_id']:
+        return
+    run = core.one('SELECT started FROM runs WHERE id=?', (task['run_id'],))
+    if 'scan_run_id' not in progress and run and (task['last_scan'] or 0) >= run['started']:
+        # Preserve in-progress fragments when upgrading a run from 0.2.0.
+        core.progress(task['id'], progress.get('stage', 'hash'), scan_run_id=task['run_id'])
+        return
+    reuse = (task['manual'] and progress.get('reuse_scan_id') == task['scan_id']
+             and task['scan_id'] and (task['last_scan'] or 0) >= core.now() - 300)
+    if reuse:
+        core.log(task['id'], '复用5分钟内刚完成的扫描；读取和打包时仍检查源文件是否变化', run_id=task['run_id'])
+    else:
+        core.log(task['id'], '开始备份前扫描：清单已过期或本次为新的自动运行', run_id=task['run_id'])
+        scan_task(task, lambda: STOP.is_set() or bool(core.one('SELECT paused FROM tasks WHERE id=?', (task['id'],))['paused']))
+    core.progress(task['id'], 'hash', percent=None, phase_bytes=0, phase_total=0,
+                  scan_run_id=task['run_id'], reuse_scan_id=None,
+                  catalog_dirty=any(k != 'unchanged' and v for k, v in summary(task['id']).items()))
 
 
 def next_due(task: dict) -> float | None:
@@ -435,6 +457,7 @@ def schedule():
 
 
 def loop():
+    global ACTIVE_TASK
     core.execute("UPDATE objects SET status='ready' WHERE status='uploading'")
     core.execute("UPDATE tasks SET status='queued' WHERE operation IS NOT NULL AND paused=0 AND status NOT IN ('error','scan_ready')")
     while not STOP.is_set():
@@ -454,6 +477,7 @@ def loop():
                 WAKE.clear()
                 continue
             task = selected
+            ACTIVE_TASK = task['id']
             try:
                 if task['operation'] == 'scan':
                     scan_task(task, lambda: STOP.is_set() or bool(core.one('SELECT paused FROM tasks WHERE id=?', (task['id'],))['paused']))
@@ -463,10 +487,7 @@ def loop():
                         start_run(task)
                         task = core.one('SELECT * FROM tasks WHERE id=?', (task['id'],))
                     else:
-                        run = core.one('SELECT started FROM runs WHERE id=?', (task['run_id'],))
-                        if run and (task['last_scan'] or 0) < run['started']:
-                            scan_task(task, lambda: STOP.is_set() or bool(core.one('SELECT paused FROM tasks WHERE id=?', (task['id'],))['paused']))
-                            core.progress(task['id'], 'scan_complete', catalog_dirty=True)
+                        ensure_run_scan(task)
                     one_group(task)
             except Interrupted:
                 core.set_status(task['id'], 'paused' if not STOP.is_set() else 'queued')
@@ -478,6 +499,8 @@ def loop():
                     core.execute("UPDATE runs SET status='error',error=? WHERE id=?", (core.redact(error), task['run_id']))
                 core.log(task['id'], '需要处理：' + core.redact(error), 'error', task.get('run_id'))
                 notify_terminal(task, core.redact(error))
+            finally:
+                ACTIVE_TASK = None
         except Exception as error:
             # No raw exceptions: upstream errors may carry credential-bearing URLs.
             print('worker:', core.redact(error), flush=True)
