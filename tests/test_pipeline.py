@@ -59,6 +59,24 @@ def tools_available():
     return shutil.which(os.getenv('NCB_7ZZ', '7zz')) and shutil.which(os.getenv('NCB_PAR2', 'par2'))
 
 
+@pytest.mark.skipif(not tools_available(), reason='7zz and par2 are required for integration tests')
+def test_small_files_fill_4096_member_pack_then_overflow(state):
+    from app.scan import scan_task
+    for index in range(4097):
+        (state / ('small-%04d.txt' % index)).write_text(str(index), encoding='utf-8')
+    task = make_task(state)
+    scan_task(task)
+    archive.prepare_candidates(task)
+    assert core.one('SELECT COUNT(*) n FROM scan WHERE sha256 IS NOT NULL')['n'] == 4096
+    group = archive.create_group(task)
+    assert archive.build_pack(task, group)
+    first = core.one('SELECT pack,COUNT(*) n,SUM(length) bytes FROM members GROUP BY pack')
+    assert first['n'] == 4096 and first['bytes'] < core.PACK_PAYLOAD
+    archive.prepare_candidates(task)
+    assert archive.build_pack(task, group)
+    assert sorted(r['n'] for r in core.rows('SELECT COUNT(*) n FROM members GROUP BY pack')) == [1,4096]
+
+
 def process(task):
     worker.start_run(task)
     for _ in range(30):

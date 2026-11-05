@@ -24,8 +24,9 @@ SECRET_LOCK = threading.RLock()
 MAX_UPLOAD = int(os.getenv('NCB_MAX_UPLOAD_BYTES', '3900000000'))
 PACK_PAYLOAD = int(os.getenv('NCB_PACK_BYTES', '3700000000'))
 GROUP_PACKS = int(os.getenv('NCB_GROUP_PACKS', '5'))
+PACK_FILES = 4096
 TEXT_LIMIT = 512 * 1024
-VERSION = '0.2.1'
+VERSION = '0.2.2'
 
 DEFAULTS = {
     'night_start': '', 'night_end': '', 'quota_gb': 128,

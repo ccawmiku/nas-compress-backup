@@ -127,7 +127,7 @@ def resolve_reuse(task: dict, item: dict) -> bool:
 
 def prepare_candidates(task: dict, stopped=lambda: False):
     # Hash only files whose metadata changed. Hash reads are streaming, not staged copies.
-    candidates = core.rows("SELECT * FROM scan WHERE task_id=? AND state='pending' AND sha256 IS NULL AND kind IN ('new','modified') ORDER BY path LIMIT 128", (task['id'],))
+    candidates = core.rows("SELECT * FROM scan WHERE task_id=? AND state='pending' AND sha256 IS NULL AND kind IN ('new','modified') ORDER BY path LIMIT ?", (task['id'], core.PACK_FILES))
     hashed_bytes = 0
     for item in candidates:
         if stopped():
@@ -144,6 +144,9 @@ def prepare_candidates(task: dict, stopped=lambda: False):
                 return
             core.execute("UPDATE scan SET state='unstable',error=? WHERE task_id=? AND path=?", (core.redact(error), task['id'], item['path']))
             core.log(task['id'], '文件暂未处理：' + item['path'] + '；' + core.redact(error), 'warning', task['run_id'])
+        finally:
+            # Text baselines are already persisted; don't retain up to4096 copies in RAM.
+            item.pop('text_content', None)
 
 
 def build_pack(task: dict, group: dict) -> bool:
@@ -154,7 +157,9 @@ def build_pack(task: dict, group: dict) -> bool:
     number = len(logical) + 1
     if number > core.GROUP_PACKS:
         return False
-    candidates = core.rows("SELECT * FROM scan WHERE task_id=? AND state='pending' AND sha256 IS NOT NULL AND kind IN ('new','modified') ORDER BY path LIMIT 512", (task_id,))
+    candidates = core.rows("""SELECT task_id,path,root,relative,size,mtime_ns,ctime_ns,kind,state,sha256,offset,staged_parts
+      FROM scan WHERE task_id=? AND state='pending' AND sha256 IS NOT NULL
+      AND kind IN ('new','modified') ORDER BY path LIMIT ?""", (task_id, core.PACK_FILES))
     if not candidates:
         return False
     level = compression(candidates[0]['path'])
@@ -171,7 +176,7 @@ def build_pack(task: dict, group: dict) -> bool:
     for item in candidates:
         if compression(item['path']) != level:
             continue
-        if members and (total >= core.PACK_PAYLOAD or len(members) >= 128):
+        if members and (total >= core.PACK_PAYLOAD or len(members) >= core.PACK_FILES):
             break
         size = min(item['size'] - item['offset'], core.PACK_PAYLOAD - total)
         if size < 0:
