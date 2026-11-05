@@ -1,0 +1,17 @@
+.git
+.venv
+**/node_modules
+**/__pycache__
+.pytest_cache
+frontend/dist
+data
+work
+output
+secrets
+.env
+*.sqlite*
+*.log
+tests
+test-results
+playwright-report
+

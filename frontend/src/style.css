@@ -1,0 +1,9 @@
+@import "tailwindcss";
+@plugin "daisyui" {
+  themes: winter --default, dim --prefersdark;
+}
+@layer base {
+  body { font-family: Inter, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; }
+  button, input, select, textarea { font: inherit; }
+  progress { transition: color .2s; }
+}

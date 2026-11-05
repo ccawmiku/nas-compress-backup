@@ -1,0 +1,29 @@
+services:
+  nas-compress-backup:
+    image: ghcr.io/ccawmiku/nas-compress-backup:latest
+    container_name: nas-compress-backup
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 1536m
+    cpu_shares: 256
+    environment:
+      TZ: Asia/Shanghai
+      NCB_ROOTS: /volume1,/volume2
+      NCB_HOST_DATA: /volume2/docker/nas-compress-backup
+      NCB_HOST_WORK: /volume1/暂时上传/.working/nas-compress-backup
+      NCB_HOST_OUT: /volume1/暂时上传/nas-compress-backup
+    volumes:
+      - /volume1:/volume1:ro
+      - /volume2:/volume2:ro
+      - /volume2/docker/nas-compress-backup/data:/data
+      - /volume1/暂时上传/.working/nas-compress-backup:/work
+      - /volume1/暂时上传/nas-compress-backup:/output
+      # Optional: a private bootstrap file may be mounted here. Never put real credentials in this Compose file.
+      # - /volume2/docker/nas-compress-backup/secrets/bootstrap.json:/run/secrets/bootstrap.json:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
