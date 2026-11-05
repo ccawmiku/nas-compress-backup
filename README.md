@@ -27,7 +27,7 @@
 目前提供 Linux amd64 镜像，适合 x86-64 群晖。镜像由本仓库 GitHub Actions 测试、构建并发布：
 
 ```text
-ghcr.io/ccawmiku/nas-compress-backup:latest
+ghcr.io/ccawmiku/nas-compress-backup:0.2.0
 ```
 
 1. 先运行官方 CloudDrive2 并连接百度网盘。将 `/volume1/暂时上传` 映射到 CloudDrive2 的 `/upload:ro`。

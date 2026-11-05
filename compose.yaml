@@ -1,6 +1,6 @@
 services:
   nas-compress-backup:
-    image: ghcr.io/ccawmiku/nas-compress-backup:latest
+    image: ghcr.io/ccawmiku/nas-compress-backup:0.2.0
     container_name: nas-compress-backup
     init: true
     restart: unless-stopped
