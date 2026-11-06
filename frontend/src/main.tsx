@@ -27,6 +27,7 @@ import {
   ArrowLeft,
 } from "lucide-react";
 import "./style.css";
+import logo from "./assets/logo.svg";
 
 type Any = Record<string, any>;
 const size = (n = 0) => {
@@ -138,22 +139,31 @@ function Badge({ value }: any) {
   );
 }
 function Phase({ label, value, total, percent, active, detail }: any) {
-  const p = total ? Math.min(100, (value / total) * 100) : percent;
+  const raw = total > 0 ? ((value || 0) / total) * 100 : percent;
+  const p =
+    typeof raw === "number" && Number.isFinite(raw)
+      ? Math.max(0, Math.min(100, raw))
+      : null;
+  const percentage =
+    p == null
+      ? ""
+      : `${p === 0 || p === 100 ? p : (Math.floor(p * 10) / 10).toFixed(1)}%`;
   return (
     <div>
       <div className="flex items-center justify-between gap-3 text-sm">
         <span>{label}</span>
-        <span className="font-mono text-xs text-base-content/65">
-          {total
-            ? `${size(value)} / ${size(total)}`
+        <span className="font-mono text-xs text-base-content/65 text-right">
+          {total > 0
+            ? `${size(value)} / ${size(total)} · ${percentage}`
             : p != null
-              ? `${Math.round(p)}%`
+              ? percentage
               : active
                 ? "处理中"
                 : "等待"}
         </span>
       </div>
       <progress
+        aria-label={label}
         className={`progress w-full ${active ? "progress-primary" : ""} h-2 mt-2`}
         {...(p != null
           ? { value: p, max: 100 }
@@ -170,6 +180,29 @@ function Phase({ label, value, total, percent, active, detail }: any) {
         </div>
       )}
     </div>
+  );
+}
+function CurrentPhase({ task }: any) {
+  const p = task.progress;
+  const uploading = p.stage === "upload";
+  const total = uploading ? task.upload?.total : p.phase_total;
+  const value = uploading ? task.upload?.transferred : p.phase_bytes;
+  const detail = uploading
+    ? task.active_uploads
+        ?.map(
+          (o: Any) => `${o.name}（${size(o.transferred)} / ${size(o.size)}）`,
+        )
+        .join("；")
+    : p.current_path;
+  return (
+    <Phase
+      label={`${stages[p.stage] || states[task.status] || "当前阶段"}${p.stage === "hash" ? " · 当前文件" : ""}`}
+      value={value || 0}
+      total={total || 0}
+      percent={task.status === "complete" ? 100 : p.percent}
+      active={["scanning", "running"].includes(task.status)}
+      detail={detail}
+    />
   );
 }
 function Modal({ title, children, close, wide = false }: any) {
@@ -226,9 +259,13 @@ function Auth({ status, done }: any) {
       <div className="card bg-base-100 w-full max-w-md shadow-sm">
         <div className="card-body gap-5">
           <div className="flex items-center gap-3">
-            <div className="bg-primary/10 p-3 rounded-box text-primary">
-              <Archive size={25} />
-            </div>
+            <img
+              src={logo}
+              alt=""
+              width={52}
+              height={52}
+              className="size-13 shrink-0"
+            />
             <div>
               <h1 className="text-xl font-semibold">NAS 压缩备份</h1>
               <p className="text-sm text-base-content/60">
@@ -681,7 +718,7 @@ function TaskEditor({ task, close, saved, report }: any) {
                 }
               />
               <span className="text-xs text-base-content/55">
-                本任务每次备份结束后，再隔指定天数检查增量；到期后在设置的夜间窗口执行。首次备份仍需手动开始。
+                本任务每次备份结束后，再隔指定天数检查增量；到期后按设置在夜间或全天执行。首次备份仍需手动开始。
               </span>
             </label>
             <div className="alert bg-base-200 text-sm">
@@ -1111,7 +1148,7 @@ function FileTable({ task, type, report, revision }: any) {
   );
 }
 
-function TaskOverview({ task }: any) {
+function TaskOverview({ task, nightOnly }: any) {
   const p = task.progress,
     u = task.upload;
   const changed = Object.entries(task.scan_summary || {})
@@ -1137,7 +1174,9 @@ function TaskOverview({ task }: any) {
               <div className="text-xs text-base-content/55 mt-1">
                 {task.manual && task.operation === "backup"
                   ? "本次为手动运行，不受夜间时段限制"
-                  : "自动运行遵守设置中的夜间窗口"}
+                  : nightOnly
+                    ? "自动运行遵守设置中的夜间窗口"
+                    : "全天运行：任务到达各自的增量周期后自动开始"}
               </div>
             </div>
             <Badge value={task.status} />
@@ -1161,7 +1200,7 @@ function TaskOverview({ task }: any) {
               />
             ) : (
               <Phase
-                label={`本次文件处理 ${done} / ${changed}`}
+                label={`本次已处理文件 ${done} / ${changed}`}
                 percent={
                   changed
                     ? Math.min(100, (done / changed) * 100)
@@ -1169,20 +1208,20 @@ function TaskOverview({ task }: any) {
                       ? 100
                       : 0
                 }
-                detail={p.current_path}
+                detail="大文件全部分段处理后计入；本次备份仍需完成上传核对和索引提交。"
+              />
+            )}
+            {task.status !== "scanning" && task.source?.total > 0 && (
+              <Phase
+                label="源数据已封包 / 内容复用"
+                value={task.source.prepared}
+                total={task.source.total}
+                active={task.status === "running"}
+                detail="按源文件字节统计，包含大文件已完成的分段；封包后还需上传、核对并提交索引。"
               />
             )}
             <div className="grid md:grid-cols-2 gap-6">
-              <Phase
-                label={stages[p.stage] || "当前阶段"}
-                percent={p.percent}
-                active={task.status === "running"}
-                detail={
-                  p.phase_total
-                    ? `${size(p.phase_bytes)} / ${size(p.phase_total)}`
-                    : ""
-                }
-              />
+              <CurrentPhase task={task} />
               <Phase
                 label={`本次上传 ${u.done || 0} / ${u.count || 0} 个对象`}
                 value={u.transferred || 0}
@@ -1190,6 +1229,17 @@ function TaskOverview({ task }: any) {
                 active={task.status === "running"}
               />
             </div>
+            {!!task.groups?.count && (
+              <div className="text-xs text-base-content/55">
+                恢复组已确认 {task.groups.done} / {task.groups.count}
+                {task.operation === "backup" && p.pack_number
+                  ? ` · 当前组第 ${p.pack_number} 包`
+                  : ""}
+                {task.operation === "backup"
+                  ? " · 新包生成后上传总量会继续增加"
+                  : ""}
+              </div>
+            )}
           </div>
           <ul className="steps steps-horizontal text-xs w-full mt-5">
             <li className="step step-primary">扫描</li>
@@ -1241,7 +1291,7 @@ function TaskOverview({ task }: any) {
         <Moon size={18} />
         <span>
           {task.auto
-            ? `每 ${task.interval_days} 天检查增量 · ${task.next_run_at ? `下次到期 ${date(task.next_run_at)}，到期后在夜间窗口执行` : "首次备份完成后开始计时"}`
+            ? `每 ${task.interval_days} 天检查增量 · ${task.next_run_at ? `下次到期 ${date(task.next_run_at)}，${nightOnly ? "到期后在夜间窗口执行" : "到期后全天可执行"}` : "首次备份完成后开始计时"}`
             : "本任务仅手动运行"}
         </span>
       </div>
@@ -1441,7 +1491,7 @@ function SettingsPage({ report, notify, changed }: any) {
             运行时段与空间
           </h2>
           <p className="text-xs text-base-content/60">
-            北京时间。窗口结束后允许当前包和已经开始的上传收尾；手动运行可临时绕过时段。
+            开启夜间限制时按北京时间运行，窗口结束后允许当前包和已开始的上传收尾。关闭后全天按任务周期自动运行；手动运行始终可用。
           </p>
           <div className="grid sm:grid-cols-3 gap-4 mt-3">
             <label className="block">
@@ -1450,6 +1500,7 @@ function SettingsPage({ report, notify, changed }: any) {
                 type="time"
                 className="input input-bordered w-full mt-2"
                 value={config.night_start}
+                disabled={!config.auto_schedule}
                 onChange={(e) => update("night_start", e.target.value)}
               />
             </label>
@@ -1459,6 +1510,7 @@ function SettingsPage({ report, notify, changed }: any) {
                 type="time"
                 className="input input-bordered w-full mt-2"
                 value={config.night_end}
+                disabled={!config.auto_schedule}
                 onChange={(e) => update("night_end", e.target.value)}
               />
             </label>
@@ -1474,12 +1526,13 @@ function SettingsPage({ report, notify, changed }: any) {
               />
             </label>
           </div>
-          {(!config.night_start || !config.night_end) && (
-            <div className="alert alert-warning text-xs mt-3">
-              <CircleAlert size={16} />
-              夜间时段尚未设置。定时任务会等待，你仍可手动扫描和运行。
-            </div>
-          )}
+          {config.auto_schedule &&
+            (!config.night_start || !config.night_end) && (
+              <div className="alert alert-warning text-xs mt-3">
+                <CircleAlert size={16} />
+                夜间时段尚未设置。定时任务会等待，你仍可手动扫描和运行。
+              </div>
+            )}
           <label className="label justify-start gap-3 mt-2">
             <input
               className="toggle toggle-primary toggle-sm"
@@ -1487,8 +1540,13 @@ function SettingsPage({ report, notify, changed }: any) {
               checked={config.auto_schedule}
               onChange={(e) => update("auto_schedule", e.target.checked)}
             />
-            <span className="text-sm">启用夜间自动调度</span>
+            <span className="text-sm">仅在夜间时段自动运行</span>
           </label>
+          <div className="text-xs text-base-content/65">
+            {config.auto_schedule
+              ? "已启用夜间限制，任务到期后等待夜间窗口。"
+              : "已关闭夜间限制，全天可运行；仍遵守每个任务的增量周期和暂停设置。"}
+          </div>
           <div className="text-xs text-base-content/55">
             轻负载模式：单个打包进程、单线程压缩与冗余计算。
           </div>
@@ -1818,10 +1876,10 @@ function App() {
         </header>
         <main className="p-4 lg:p-7 w-full max-w-screen-2xl mx-auto">
           {page !== "settings" && data.night.enabled === false && (
-            <div className="alert alert-warning mb-5 text-sm">
-              <Moon size={18} />
+            <div className="alert bg-base-100 border border-base-300 mb-5 text-sm">
+              <Sun size={18} />
               <span>
-                全局自动调度已关闭，到夜间也不会自动开始。暂停的任务需要单独点“继续”。所有时间均为北京时间。
+                全天运行模式：已关闭夜间限制，任务到达各自的增量周期后自动开始。暂停的任务仍需单独点“继续”。
               </span>
               <button
                 className="btn btn-sm"
@@ -1844,7 +1902,8 @@ function App() {
                     <Badge value={task.status} />
                     {!!task.auto && (
                       <span className="text-xs text-base-content/50">
-                        每 {task.interval_days} 天增量 · 夜间执行
+                        每 {task.interval_days} 天增量 ·{" "}
+                        {data.night.enabled ? "夜间执行" : "全天可运行"}
                       </span>
                     )}
                   </div>
@@ -1949,7 +2008,7 @@ function App() {
                 </button>
               </div>
               {tab === "overview" ? (
-                <TaskOverview task={task} />
+                <TaskOverview task={task} nightOnly={data.night.enabled} />
               ) : tab === "logs" ? (
                 <RunList taskId={task.id} report={report} />
               ) : (
@@ -1980,7 +2039,7 @@ function App() {
                   新建任务
                 </button>
               </div>
-              {(!data.night.start || !data.night.end) && (
+              {data.night.enabled && (!data.night.start || !data.night.end) && (
                 <div className="alert bg-base-100 border border-base-300 text-sm mb-5">
                   <Moon size={18} />
                   <span>
@@ -2015,13 +2074,7 @@ function App() {
                         <Badge value={t.status} />
                       </div>
                       <div className="mt-3">
-                        <Phase
-                          label={stages[t.progress.stage] || states[t.status]}
-                          percent={
-                            t.status === "complete" ? 100 : t.progress.percent
-                          }
-                          active={["scanning", "running"].includes(t.status)}
-                        />
+                        <CurrentPhase task={t} />
                       </div>
                       <div className="flex justify-between text-xs opacity-50 mt-2">
                         <span>
@@ -2086,7 +2139,13 @@ function App() {
               navigate("tasks");
             }}
           >
-            <Archive className="text-primary" size={25} />
+            <img
+              src={logo}
+              alt=""
+              width={36}
+              height={36}
+              className="size-9 shrink-0"
+            />
             <div>
               <div className="font-semibold text-base">NAS 压缩备份</div>
               <div className="text-xs text-base-content/45">任务式增量归档</div>

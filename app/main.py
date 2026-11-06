@@ -182,6 +182,15 @@ def task_statistics(task):
     result['upload'] = upload
     result['scan_summary'] = worker.summary(task['id'])
     result['processed'] = core.one("SELECT COUNT(*) count,COALESCE(SUM(size),0) bytes FROM scan WHERE task_id=? AND state='done' AND kind NOT IN ('unchanged','moved_from')", (task['id'],))
+    result['source'] = core.one('''SELECT COUNT(*) count,COALESCE(SUM(size),0) total,
+       COALESCE(SUM(CASE WHEN state='done' THEN size ELSE MIN(offset,COALESCE(size,0)) END),0) prepared
+       FROM scan WHERE task_id=? AND kind NOT IN ('unchanged','moved_from','deleted')''', (task['id'],))
+    result['active_uploads'] = core.rows('''SELECT o.name,o.size,o.transferred FROM objects o
+       JOIN groups g ON g.id=o.group_id WHERE g.task_id=? AND g.run_id=? AND o.status='uploading'
+       ORDER BY o.rowid LIMIT 2''', (task['id'], task['run_id']))
+    result['groups'] = core.one('''SELECT COUNT(*) count,
+       COALESCE(SUM(CASE WHEN status='committed' THEN 1 ELSE 0 END),0) done
+       FROM groups WHERE task_id=? AND run_id=? AND status NOT IN ('empty','cancelled')''', (task['id'], task['run_id']))
     result['files'] = core.one('SELECT COUNT(*) count,COALESCE(SUM(size),0) bytes,SUM(CASE WHEN present=0 THEN 1 ELSE 0 END) retained FROM files_current WHERE task_id=?', (task['id'],))
     run = core.one('SELECT started FROM runs WHERE id=?', (task['run_id'],)) if task['run_id'] else None
     result['run_started'] = run['started'] if run else None
@@ -573,6 +582,8 @@ def get_settings():
 @app.put('/api/settings')
 def put_settings(body: dict):
     values = {k: v for k, v in body.items() if k in core.DEFAULTS}
+    if 'auto_schedule' in values and not isinstance(values['auto_schedule'], bool):
+        raise ValueError('夜间时段开关应为布尔值')
     for name in ('night_start', 'night_end'):
         if values.get(name):
             try:

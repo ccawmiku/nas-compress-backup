@@ -99,6 +99,8 @@ def test_bounded_fragment_pipeline_incremental_and_par2(state, monkeypatch, tmp_
     task = make_task(state)
     result = process(task)
     assert result['status'] == 'complete'
+    parity_logs = core.rows("SELECT message FROM logs WHERE message LIKE '冗余计划：%'")
+    assert parity_logs and all(' MB，恢复块 ' in row['message'] and ' 字节' not in row['message'] for row in parity_logs)
     assert result['last_completed'] >= result['last_success']
     assert worker.next_due(result) == result['last_completed'] + 7 * 86400
     files = core.rows('SELECT * FROM files WHERE task_id=?', (task['id'],))

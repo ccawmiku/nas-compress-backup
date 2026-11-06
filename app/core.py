@@ -26,7 +26,7 @@ PACK_PAYLOAD = int(os.getenv('NCB_PACK_BYTES', '3700000000'))
 GROUP_PACKS = int(os.getenv('NCB_GROUP_PACKS', '5'))
 PACK_FILES = 4096
 TEXT_LIMIT = 512 * 1024
-VERSION = '0.2.4'
+VERSION = '0.2.5'
 
 DEFAULTS = {
     'night_start': '', 'night_end': '', 'quota_gb': 128,
@@ -212,6 +212,9 @@ def log(task_id: str | None, message: str, level='info', run_id=None):
 def progress(task_id: str, stage: str, **values):
     task = one('SELECT progress FROM tasks WHERE id=?', (task_id,))
     current = json.loads(task['progress']) if task else {}
+    if current.get('stage') != stage:
+        current.update(percent=None, phase_bytes=0, phase_total=0, current_path='',
+                       stage_started=now())
     current.update(values)
     current['stage'] = stage
     current['heartbeat'] = now()

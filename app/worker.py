@@ -75,6 +75,8 @@ def settle_cancellations():
 def window(config=None, date=None) -> tuple[bool, str]:
     config = config or core.settings()
     date = date or datetime.now(TZ)
+    if not config.get('auto_schedule', True):
+        return True, date.date().isoformat()
     try:
         start = datetime.strptime(config['night_start'], '%H:%M').time()
         end = datetime.strptime(config['night_end'], '%H:%M').time()
@@ -527,7 +529,7 @@ def next_due(task: dict) -> float | None:
 
 def schedule():
     inside, key = window()
-    if not inside or not core.settings()['auto_schedule']:
+    if not inside:
         return
     for task in core.rows("SELECT * FROM tasks WHERE auto=1 AND initialized=1 AND operation IS NULL AND paused=0 AND status IN ('complete','attention')"):
         due = next_due(task)

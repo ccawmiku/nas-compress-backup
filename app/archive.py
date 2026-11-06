@@ -35,6 +35,8 @@ def password(task_id: str | None = None) -> str:
 def tool(command: list[str], task_id: str, stage: str, cwd=None):
     started=time.monotonic()
     core.set_status(task_id, 'running')
+    core.progress(task_id, stage, percent=0, phase_bytes=0, phase_total=0,
+                  stage_started=core.now())
     if os.name == 'posix' and shutil.which('nice'):
         command = ['nice', '-n', '10', *command]
     proc = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -60,6 +62,7 @@ def tool(command: list[str], task_id: str, stage: str, cwd=None):
 
 
 def seven(verb: str, archive: Path, task_id: str, extra=(), cwd=None, stage='pack'):
+    core.progress(task_id, stage, current_path=archive.name)
     tool([os.getenv('NCB_7ZZ', '7zz'), verb, '-y', '-bb0', '-bsp1', '-p' + password(task_id),
           str(archive), *extra], task_id, stage, cwd)
 
@@ -133,8 +136,12 @@ def resolve_reuse(task: dict, item: dict) -> bool:
 def prepare_candidates(task: dict, stopped=lambda: False):
     # Hash only files whose metadata changed. Hash reads are streaming, not staged copies.
     candidates = core.rows("SELECT * FROM scan WHERE task_id=? AND state='pending' AND sha256 IS NULL AND kind IN ('new','modified') ORDER BY path LIMIT ?", (task['id'], core.PACK_FILES))
+    if candidates:
+        core.progress(task['id'], 'hash', percent=0, phase_bytes=0,
+                      phase_total=candidates[0]['size'], current_path=candidates[0]['path'])
     hashed_bytes = 0
     batch = []
+    last_hashed = None
     def flush():
         if not batch:
             return
@@ -154,6 +161,7 @@ def prepare_candidates(task: dict, stopped=lambda: False):
                 return
             try:
                 hash_candidate(item,task['id'],stopped,persist=False)
+                last_hashed = item
                 batch.append(item)
                 hashed_bytes+=item['size']
                 if len(batch)>=32 or hashed_bytes>=core.PACK_PAYLOAD:
@@ -168,6 +176,9 @@ def prepare_candidates(task: dict, stopped=lambda: False):
                 core.log(task['id'],'文件暂未处理：'+item['path']+'；'+core.redact(error),'warning',task['run_id'])
     finally:
         flush()
+        if last_hashed and not stopped():
+            core.progress(task['id'], 'hash', percent=100, phase_bytes=last_hashed['size'],
+                          phase_total=last_hashed['size'], current_path=last_hashed['path'])
 
 
 def build_pack(task: dict, group: dict) -> bool:
@@ -196,6 +207,8 @@ def build_pack(task: dict, group: dict) -> bool:
     total = 0
     planned = min(core.PACK_PAYLOAD,sum(min(max(0,i['size']-i['offset']),core.PACK_PAYLOAD) for i in candidates if compression(i['path'])==level))
     space_check(planned*2+4*1024**2)
+    core.progress(task_id, 'stage', percent=0, phase_bytes=0, phase_total=planned,
+                  pack_number=number, group_id=group['id'])
     last_progress = 0.0
     for item in candidates:
         if compression(item['path']) != level:
@@ -233,8 +246,8 @@ def build_pack(task: dict, group: dict) -> bool:
                     remaining -= len(chunk)
                     if time.monotonic() - last_progress > 0.5:
                         core.progress(task_id, 'stage', current_path=item['path'],
-                                      phase_bytes=total + size - remaining, phase_total=core.PACK_PAYLOAD,
-                                      percent=100 * (total + size - remaining) / core.PACK_PAYLOAD)
+                                      phase_bytes=total + size - remaining, phase_total=planned,
+                                      percent=100 * (total + size - remaining) / max(planned, 1))
                         last_progress = time.monotonic()
             if core.signature(source) != expected:
                 raise SourceChanged('源文件在复制期间变化')
@@ -253,6 +266,8 @@ def build_pack(task: dict, group: dict) -> bool:
         return False
     listing = stage.parent / ('pack-%03d.lst' % number)
     listing.write_text('\n'.join(m['entry'] for m in members) + '\n', encoding='utf-8')
+    core.progress(task_id, 'stage', percent=100, phase_bytes=total, phase_total=total,
+                  current_path=members[-1]['path'])
     archive = directory / pack_name
     core.progress(task_id, 'pack', current_path=pack_name, percent=0, pack_number=number)
     dictionary = ['-md=8m' if level>=3 else '-md=1m'] if level else []
@@ -324,7 +339,7 @@ def close_group(task: dict, group: dict):
     block,count,volumes = parity_layout(total,largest)
     space_check(block * count + 4 * 1024**2)
     core.progress(task['id'], 'parity', percent=0, current_path='生成完整文件丢失保护')
-    core.log(task['id'],f'冗余计划：块大小 {block} 字节，恢复块 {count}，内存预算96MiB，单线程',run_id=task['run_id'])
+    core.log(task['id'],f'冗余计划：块大小 {block / 1_000_000:.1f} MB，恢复块 {count}，内存预算96MiB，单线程',run_id=task['run_id'])
     tool([os.getenv('NCB_PAR2', 'par2'), 'create', '-t1', '-m96', '-s%d' % block,
           '-c%d' % count, '-u', '-n%d' % volumes, str(directory / 'recovery.par2'),
           *[str(p) for p in protected]], task['id'], 'parity', cwd=directory)
