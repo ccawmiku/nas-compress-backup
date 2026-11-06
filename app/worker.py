@@ -22,10 +22,30 @@ STOP = threading.Event()
 UPLOADS = ThreadPoolExecutor(max_workers=2, thread_name_prefix='cloud-upload')
 FUTURES = {}
 ACTIVE_TASK = None
+CONTROL_LOCK = threading.RLock()
+ALLOW_CACHE = {}
+
+
+def task_busy(task_id):
+    if ACTIVE_TASK == task_id:
+        return True
+    for object_id,future in list(FUTURES.items()):
+        if not future.done() and core.one('SELECT 1 FROM objects o JOIN groups g ON g.id=o.group_id WHERE o.id=? AND g.task_id=?',(object_id,task_id)):
+            return True
+    return bool(core.one('SELECT 1 FROM publications WHERE task_id=?',(task_id,)))
+
+
+def settle_pauses():
+    with CONTROL_LOCK:
+        for task in core.rows("SELECT id FROM tasks WHERE paused=1 AND status='pausing'"):
+            if not task_busy(task['id']):
+                core.set_status(task['id'],'paused')
 
 
 def settle_cancellations():
     for task in core.rows('SELECT * FROM tasks WHERE cancel_requested=1'):
+        if ACTIVE_TASK == task['id']:
+            continue
         if core.one('SELECT task_id FROM publications WHERE task_id=?', (task['id'],)):
             continue
         active = False
@@ -72,6 +92,19 @@ def window(config=None, date=None) -> tuple[bool, str]:
 def allowed(task_id):
     task = core.one('SELECT * FROM tasks WHERE id=?', (task_id,))
     return bool(task and not task['paused'] and not STOP.is_set() and (task['manual'] or window()[0]))
+
+
+def allow_poll(task_id):
+    if STOP.is_set():
+        return False
+    old = ALLOW_CACHE.get(task_id)
+    if old and time.monotonic()-old[0]<0.25:
+        return old[1]
+    result = allowed(task_id)
+    if len(ALLOW_CACHE)>256:
+        ALLOW_CACHE.clear()
+    ALLOW_CACHE[task_id]=(time.monotonic(),result)
+    return result
 
 
 def notify_terminal(task: dict, message: str):
@@ -402,7 +435,7 @@ def one_group(task: dict):
     core.set_status(task_id, 'running')
     group = core.one("SELECT * FROM groups WHERE task_id=? AND status NOT IN ('committed','empty','retired','cancelled') ORDER BY created LIMIT 1", (task_id,))
     if not group:
-        archive.prepare_candidates(task, lambda: not allowed(task_id))
+        archive.prepare_candidates(task, lambda: not allow_poll(task_id))
         if not allowed(task_id):
             return
         pending = core.one("SELECT COUNT(*) n FROM scan WHERE task_id=? AND state='pending' AND kind IN ('new','modified')", (task_id,))['n']
@@ -423,7 +456,7 @@ def one_group(task: dict):
             raise CloudError('文件上传重试耗尽，请检查 CloudDrive2、账号状态或网络后重试')
         group = core.one('SELECT * FROM groups WHERE id=?', (group['id'],))
         if group['status'] == 'building':
-            archive.prepare_candidates(task, lambda: not allowed(task_id))
+            archive.prepare_candidates(task, lambda: not allow_poll(task_id))
             if not allowed(task_id):
                 continue
             if archive.build_pack(task, group):
@@ -513,7 +546,9 @@ def loop():
     while not STOP.is_set():
         try:
             recover_publications()
-            settle_cancellations()
+            with CONTROL_LOCK:
+                settle_cancellations()
+                settle_pauses()
             for waiting in core.rows("SELECT id FROM tasks WHERE status='space_wait' AND paused=0"):
                 try:
                     archive.reserve_group()
@@ -521,14 +556,15 @@ def loop():
                 except archive.Wait:
                     pass
             schedule()
-            tasks = core.rows("SELECT * FROM tasks WHERE operation IS NOT NULL AND paused=0 AND status NOT IN ('error','scan_ready','space_wait') ORDER BY updated")
-            selected = next((t for t in tasks if t['operation'] == 'scan' or allowed(t['id'])), None)
+            with CONTROL_LOCK:
+                tasks = core.rows("SELECT * FROM tasks WHERE operation IS NOT NULL AND paused=0 AND status NOT IN ('error','scan_ready','space_wait') ORDER BY updated")
+                selected = next((t for t in tasks if t['operation'] == 'scan' or allowed(t['id'])), None)
+                ACTIVE_TASK = selected['id'] if selected else None
             if not selected:
                 WAKE.wait(2)
                 WAKE.clear()
                 continue
             task = selected
-            ACTIVE_TASK = task['id']
             try:
                 if task['operation'] == 'scan':
                     scan_task(task, lambda: STOP.is_set() or bool(core.one('SELECT paused FROM tasks WHERE id=?', (task['id'],))['paused']))
@@ -551,7 +587,9 @@ def loop():
                 core.log(task['id'], '需要处理：' + core.redact(error), 'error', task.get('run_id'))
                 notify_terminal(task, core.redact(error))
             finally:
-                ACTIVE_TASK = None
+                with CONTROL_LOCK:
+                    ACTIVE_TASK = None
+                    settle_pauses()
         except Exception as error:
             # No raw exceptions: upstream errors may carry credential-bearing URLs.
             print('worker:', core.redact(error), flush=True)

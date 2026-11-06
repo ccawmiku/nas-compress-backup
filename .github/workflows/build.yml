@@ -48,6 +48,8 @@ jobs:
       - name: Build React and daisyUI frontend
         working-directory: frontend
         run: npm ci && npm run build
+      - name: Bounded PAR2 speed and memory benchmark
+        run: python scripts/benchmark_par2.py
       - name: Check repository for accidental credentials
         run: python scripts/check_public.py
 

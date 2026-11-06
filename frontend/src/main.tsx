@@ -290,6 +290,7 @@ function Auth({ status, done }: any) {
 }
 
 function FolderPicker({ selected, choose, close, report }: any) {
+  const [chosen, setChosen] = useState<string[]>([...selected]);
   const [listing, setListing] = useState<Any>({ path: "", entries: [] }),
     [busy, setBusy] = useState(false),
     [system, setSystem] = useState(false);
@@ -306,6 +307,13 @@ function FolderPicker({ selected, choose, close, report }: any) {
   useEffect(() => {
     load();
   }, []);
+  const visible = listing.entries.filter((f: Any) => system || !f.system);
+  const toggle = (path: string) =>
+    setChosen((values) =>
+      values.includes(path)
+        ? values.filter((v) => v !== path)
+        : [...values, path],
+    );
   return (
     <Modal title="选择 NAS 来源目录" close={close}>
       <div className="flex gap-2 items-center mb-3">
@@ -330,26 +338,59 @@ function FolderPicker({ selected, choose, close, report }: any) {
         />
         <span className="text-xs">显示系统和隐藏目录</span>
       </label>
+      <div className="flex items-center flex-wrap gap-2 mb-2 text-xs">
+        <button
+          className="btn btn-xs btn-ghost"
+          disabled={busy}
+          onClick={() =>
+            setChosen([
+              ...new Set([...chosen, ...visible.map((f: Any) => f.path)]),
+            ])
+          }
+        >
+          全选本目录
+        </button>
+        <button
+          className="btn btn-xs btn-ghost"
+          disabled={busy}
+          onClick={() =>
+            setChosen(
+              chosen.filter((p) => !visible.some((f: Any) => f.path === p)),
+            )
+          }
+        >
+          取消本目录选择
+        </button>
+        <span>已选择 {chosen.length} 个目录，可进入子目录继续选择</span>
+      </div>
       <div className="border border-base-300 rounded-box max-h-80 overflow-y-auto min-h-32">
         {busy ? (
           <div className="p-8 text-center">
             <span className="loading loading-spinner" />
           </div>
         ) : (
-          listing.entries
-            .filter((f: any) => system || !f.system)
-            .map((f: any) => (
+          visible.map((f: any) => (
+            <div
+              className="flex items-center gap-3 w-full text-left px-4 py-2 hover:bg-base-200 border-b border-base-200 last:border-0"
+              key={f.path}
+            >
+              <input
+                type="checkbox"
+                className="checkbox checkbox-sm"
+                aria-label={`选择 ${f.name}`}
+                checked={chosen.includes(f.path)}
+                onChange={() => toggle(f.path)}
+              />
               <button
-                className="flex items-center gap-3 w-full text-left px-4 py-3 hover:bg-base-200 border-b border-base-200 last:border-0"
-                key={f.path}
+                className="flex items-center gap-3 flex-1 min-w-0 text-left py-1"
                 onClick={() => load(f.path)}
               >
                 <Folder size={18} className="text-primary shrink-0" />
                 <span className="text-sm break-all flex-1">{f.name}</span>
-                {selected.includes(f.path) && <Check size={16} />}
                 <ChevronRight size={16} />
               </button>
-            ))
+            </div>
+          ))
         )}
       </div>
       <div className="flex justify-end gap-2 mt-5">
@@ -359,9 +400,16 @@ function FolderPicker({ selected, choose, close, report }: any) {
         <button
           className="btn btn-primary"
           disabled={!listing.path || busy}
-          onClick={() => choose(listing.path)}
+          onClick={() => choose([...new Set([...chosen, listing.path])])}
         >
           选择当前目录
+        </button>
+        <button
+          className="btn btn-primary"
+          disabled={busy}
+          onClick={() => choose(chosen)}
+        >
+          确认选择（{chosen.length}）
         </button>
       </div>
     </Modal>
@@ -647,7 +695,7 @@ function TaskEditor({ task, close, saved, report }: any) {
                 <button
                   className="btn btn-ghost text-error mr-auto"
                   type="button"
-                  disabled={!!task.operation}
+                  disabled={!task.can_remove}
                   onClick={() => setDeleting(true)}
                 >
                   移除任务
@@ -674,8 +722,8 @@ function TaskEditor({ task, close, saved, report }: any) {
           selected={form.roots}
           close={() => setPicker(false)}
           report={report}
-          choose={(path: string) => {
-            setForm({ ...form, roots: [...new Set([...form.roots, path])] });
+          choose={(paths: string[]) => {
+            setForm({ ...form, roots: paths });
             setPicker(false);
           }}
         />

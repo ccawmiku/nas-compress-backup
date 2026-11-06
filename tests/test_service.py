@@ -189,6 +189,52 @@ def test_redaction(state):
     assert 'fixture-token-only' not in text and 'private-key' not in text
 
 
+def test_idle_pause_cancel_and_delete_work_while_another_task_is_active(state,monkeypatch):
+    active=make_task(state)
+    idle=make_task(state)
+    monkeypatch.setattr(worker,'ACTIVE_TASK',active['id'])
+    (state/'keep.txt').write_text('original source')
+    with TestClient(app) as client:
+        client.post('/api/auth/setup',json={'password':'testing-password'})
+        assert client.post(f"/api/tasks/{idle['id']}/pause").status_code==200
+        detail=client.get(f"/api/tasks/{idle['id']}").json()
+        assert detail['status']=='paused' and detail['can_remove']
+        assert client.delete(f"/api/tasks/{idle['id']}").json()['cloud_files_retained']
+        assert core.one('SELECT id FROM tasks WHERE id=?',(active['id'],))
+        assert (state/'keep.txt').read_text()=='original source'
+        another=make_task(state)
+        client.post(f"/api/tasks/{another['id']}/cancel")
+        assert core.one('SELECT operation FROM tasks WHERE id=?',(another['id'],))['operation'] is None
+
+
+def test_active_task_and_pending_publication_cannot_be_deleted(state,monkeypatch):
+    task=make_task(state)
+    monkeypatch.setattr(worker,'ACTIVE_TASK',task['id'])
+    with TestClient(app) as client:
+        client.post('/api/auth/setup',json={'password':'testing-password'})
+        client.post(f"/api/tasks/{task['id']}/pause")
+        assert client.get(f"/api/tasks/{task['id']}").json()['status']=='pausing'
+        assert client.delete(f"/api/tasks/{task['id']}").status_code==409
+        monkeypatch.setattr(worker,'ACTIVE_TASK',None)
+        worker.settle_pauses()
+        assert core.one('SELECT status FROM tasks')['status']=='paused'
+        core.execute("INSERT INTO publications(task_id) VALUES (?)",(task['id'],))
+        assert client.delete(f"/api/tasks/{task['id']}").status_code==409
+
+
+def test_hash_batches_bound_memory_and_commit_fewer_transactions(state,monkeypatch):
+    from app import archive
+    from app import scan
+    for i in range(70):
+        (state/('small-%03d.txt'%i)).write_text('fixture-'+str(i))
+    task=make_task(state)
+    scan_task(task)
+    archive.prepare_candidates(task)
+    assert core.one('SELECT COUNT(*) n FROM scan WHERE sha256 IS NOT NULL')['n']==70
+    assert core.one('SELECT COUNT(*) n FROM scan WHERE text_content IS NOT NULL')['n']==70
+    assert task['id'] in scan.HASH_TICKS
+
+
 def test_cancel_releases_only_uncommitted_work_and_retains_sources(state):
     source = state / 'keep.txt'
     source.write_text('original', encoding='utf-8')

@@ -33,6 +33,7 @@ def password(task_id: str | None = None) -> str:
 
 
 def tool(command: list[str], task_id: str, stage: str, cwd=None):
+    started=time.monotonic()
     core.set_status(task_id, 'running')
     if os.name == 'posix' and shutil.which('nice'):
         command = ['nice', '-n', '10', *command]
@@ -54,6 +55,8 @@ def tool(command: list[str], task_id: str, stage: str, cwd=None):
     if result:
         raise RuntimeError(Path(command[0]).name + ' 执行失败：' + core.redact(tail.decode('utf-8', errors='replace')))
     core.progress(task_id, stage, percent=100)
+    label={'pack':'压缩加密','local_verify':'本地归档校验','parity':'冗余生成','parity_verify':'冗余校验','index':'索引处理'}.get(stage,stage)
+    core.log(task_id,f'{label}完成，耗时 {time.monotonic()-started:.1f} 秒')
 
 
 def seven(verb: str, archive: Path, task_id: str, extra=(), cwd=None, stage='pack'):
@@ -131,24 +134,40 @@ def prepare_candidates(task: dict, stopped=lambda: False):
     # Hash only files whose metadata changed. Hash reads are streaming, not staged copies.
     candidates = core.rows("SELECT * FROM scan WHERE task_id=? AND state='pending' AND sha256 IS NULL AND kind IN ('new','modified') ORDER BY path LIMIT ?", (task['id'], core.PACK_FILES))
     hashed_bytes = 0
-    for item in candidates:
-        if stopped():
+    batch = []
+    def flush():
+        if not batch:
             return
-        try:
-            hash_candidate(item, task['id'], stopped)
-            resolve_reuse(task, item)
-            hashed_bytes += item['size']
-            if hashed_bytes >= core.PACK_PAYLOAD:
+        items=batch[:]
+        batch.clear()
+        with core.connect() as db:
+            db.executemany('UPDATE scan SET sha256=?,text_content=? WHERE task_id=? AND path=?',
+                [(i['sha256'],i.get('text_content'),task['id'],i['path']) for i in items])
+        for item in items:
+            try:
+                resolve_reuse(task,item)
+            finally:
+                item.pop('text_content',None)
+    try:
+        for item in candidates:
+            if stopped():
                 return
-        except Exception as error:
-            from .scan import Interrupted
-            if isinstance(error, Interrupted):
-                return
-            core.execute("UPDATE scan SET state='unstable',error=? WHERE task_id=? AND path=?", (core.redact(error), task['id'], item['path']))
-            core.log(task['id'], '文件暂未处理：' + item['path'] + '；' + core.redact(error), 'warning', task['run_id'])
-        finally:
-            # Text baselines are already persisted; don't retain up to4096 copies in RAM.
-            item.pop('text_content', None)
+            try:
+                hash_candidate(item,task['id'],stopped,persist=False)
+                batch.append(item)
+                hashed_bytes+=item['size']
+                if len(batch)>=32 or hashed_bytes>=core.PACK_PAYLOAD:
+                    flush()
+                if hashed_bytes>=core.PACK_PAYLOAD:
+                    return
+            except Exception as error:
+                from .scan import Interrupted
+                if isinstance(error,Interrupted):
+                    return
+                core.execute("UPDATE scan SET state='unstable',error=? WHERE task_id=? AND path=?",(core.redact(error),task['id'],item['path']))
+                core.log(task['id'],'文件暂未处理：'+item['path']+'；'+core.redact(error),'warning',task['run_id'])
+    finally:
+        flush()
 
 
 def build_pack(task: dict, group: dict) -> bool:
@@ -175,6 +194,9 @@ def build_pack(task: dict, group: dict) -> bool:
         core.owned_remove(orphan, core.OUT)
     members = []
     total = 0
+    planned = min(core.PACK_PAYLOAD,sum(min(max(0,i['size']-i['offset']),core.PACK_PAYLOAD) for i in candidates if compression(i['path'])==level))
+    space_check(planned*2+4*1024**2)
+    last_progress = 0.0
     for item in candidates:
         if compression(item['path']) != level:
             continue
@@ -200,8 +222,6 @@ def build_pack(task: dict, group: dict) -> bool:
             dest.parent.mkdir(parents=True, exist_ok=True)
             h = hashlib.sha256()
             remaining = size
-            last_progress = 0.0
-            space_check(size * 2 + 4 * 1024**2)
             with source.open('rb') as src, dest.open('wb') as dst:
                 src.seek(item['offset'])
                 while remaining:
@@ -235,7 +255,8 @@ def build_pack(task: dict, group: dict) -> bool:
     listing.write_text('\n'.join(m['entry'] for m in members) + '\n', encoding='utf-8')
     archive = directory / pack_name
     core.progress(task_id, 'pack', current_path=pack_name, percent=0, pack_number=number)
-    seven('a', archive, task_id, ['-t7z', '-mhe=on', '-ms=off', '-mmt=1', '-mx=%d' % level,
+    dictionary = ['-md=8m' if level>=3 else '-md=1m'] if level else []
+    seven('a', archive, task_id, ['-t7z', '-mhe=on', '-ms=off', '-mmt=1', '-mx=%d' % level,*dictionary,
           '-scsUTF-8', '-spd', '-v%db' % core.MAX_UPLOAD, '@' + str(listing)], cwd=stage)
     volumes = sorted(directory.glob(pack_name + '.*'))
     if len(volumes) == 1:
@@ -275,6 +296,13 @@ def _json_archive(data: dict, archive: Path, task_id: str, name: str) -> list[Pa
         core.owned_remove(stage, core.WORK)
 
 
+def parity_layout(total,largest):
+    block=max(4096,math.ceil(total/256/4)*4)
+    count=math.ceil(largest/block)+2
+    volumes=min(count,31,max(2,math.ceil(block*count/max(core.MAX_UPLOAD-1024**2,1))))
+    return block,count,volumes
+
+
 def close_group(task: dict, group: dict):
     directory = group_directory(group)
     objects = core.rows("SELECT * FROM objects WHERE group_id=? AND kind='data'", (group['id'],))
@@ -293,16 +321,14 @@ def close_group(task: dict, group: dict):
     protected = [directory / o['name'] for o in objects] + extra
     total = sum(p.stat().st_size for p in protected)
     largest = max(p.stat().st_size for p in protected)
-    block = max(4096, math.ceil(total / 4096 / 4) * 4)
-    count = math.ceil(largest / block) + 2
-    volumes = max(2, math.ceil((block * count) / max(core.MAX_UPLOAD - 1024**2, 1)))
-    volumes = min(count, volumes, 31)
+    block,count,volumes = parity_layout(total,largest)
     space_check(block * count + 4 * 1024**2)
     core.progress(task['id'], 'parity', percent=0, current_path='生成完整文件丢失保护')
-    tool([os.getenv('NCB_PAR2', 'par2'), 'create', '-t1', '-m128', '-s%d' % block,
+    core.log(task['id'],f'冗余计划：块大小 {block} 字节，恢复块 {count}，内存预算96MiB，单线程',run_id=task['run_id'])
+    tool([os.getenv('NCB_PAR2', 'par2'), 'create', '-t1', '-m96', '-s%d' % block,
           '-c%d' % count, '-u', '-n%d' % volumes, str(directory / 'recovery.par2'),
           *[str(p) for p in protected]], task['id'], 'parity', cwd=directory)
-    tool([os.getenv('NCB_PAR2', 'par2'), 'verify', '-q', '-t1', '-m128', str(directory / 'recovery.par2')], task['id'], 'parity_verify', cwd=directory)
+    tool([os.getenv('NCB_PAR2', 'par2'), 'verify', '-q', '-t1', '-m96', str(directory / 'recovery.par2')], task['id'], 'parity_verify', cwd=directory)
     outputs = extra + sorted(directory.glob('recovery*.par2'))
     if any(p.stat().st_size > core.MAX_UPLOAD for p in outputs):
         raise RuntimeError('冗余文件超过3900MB限制')

@@ -193,6 +193,10 @@ def task_view(task: dict):
     for field in ('roots', 'excludes', 'progress'):
         result[field] = json.loads(result[field])
     result['progress'].update(LIVE.get(result['id'], {}))
+    busy = worker.task_busy(task['id'])
+    result['can_remove'] = not task['operation'] or bool(task['paused'] and not busy)
+    if task['paused'] and task['status']=='pausing' and not busy:
+        result['status']='paused'
     if worker.ACTIVE_TASK == task['id'] and task['operation'] == 'backup' and result['status'] == 'queued':
         result['status'] = 'running'
     stamp = (str(core.DB), task['id'], task['run_id'], task['scan_id'], task['catalog_generation'], task['status'], task['last_success'])
@@ -305,9 +309,17 @@ def update_task(task_id: str, body: dict):
 
 @app.delete('/api/tasks/{task_id}')
 def delete_task(task_id: str):
+    with worker.CONTROL_LOCK:
+        return remove_task(task_id)
+
+
+def remove_task(task_id):
     task = task_detail(task_id)
     if task['operation']:
-        raise HTTPException(409, '请先结束本次运行')
+        if not task['can_remove']:
+            raise HTTPException(409,'当前操作仍在收尾，请稍后移除任务')
+        core.execute('UPDATE tasks SET cancel_requested=1 WHERE id=?',(task_id,))
+        worker.settle_cancellations()
     with core.connect() as db:
         group_ids = [r['id'] for r in db.execute('SELECT id FROM groups WHERE task_id=?', (task_id,))]
         for group_id in group_ids:
@@ -325,6 +337,16 @@ def delete_task(task_id: str):
 
 @app.post('/api/tasks/{task_id}/{action}')
 def task_action(task_id: str, action: str):
+    if action == 'refresh-cloud':
+        return change_task_action(task_id,action)
+    with worker.CONTROL_LOCK:
+        worker.ALLOW_CACHE.pop(task_id,None)
+        result = change_task_action(task_id,action)
+        worker.ALLOW_CACHE.pop(task_id,None)
+        return result
+
+
+def change_task_action(task_id,action):
     task = core.one('SELECT * FROM tasks WHERE id=?', (task_id,))
     if not task:
         raise HTTPException(404, '任务不存在')
@@ -334,8 +356,10 @@ def task_action(task_id: str, action: str):
         if core.one('SELECT task_id FROM publications WHERE task_id=?', (task_id,)):
             raise HTTPException(409,'索引提交正在确认或等待对账，请先重试；确认后可安全结束本次运行')
         core.execute("UPDATE tasks SET paused=1,cancel_requested=1,status='pausing',updated=? WHERE id=?", (core.now(), task_id))
+        worker.settle_cancellations()
     elif action == 'pause':
         core.execute("UPDATE tasks SET paused=1,status='pausing',updated=? WHERE id=?", (core.now(), task_id))
+        worker.settle_pauses()
     elif action in ('resume', 'retry'):
         core.execute("UPDATE tasks SET paused=0,status='queued',error=NULL,updated=? WHERE id=?", (core.now(), task_id))
         core.execute("UPDATE objects SET status='ready',attempts=0,retry_at=0,error=NULL WHERE status='failed' AND group_id IN (SELECT id FROM groups WHERE task_id=?)", (task_id,))

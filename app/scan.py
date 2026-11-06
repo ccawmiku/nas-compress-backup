@@ -113,9 +113,10 @@ def scan_task(task: dict, stopped=lambda: False) -> dict:
 
 
 LIVE: dict[str, dict] = {}
+HASH_TICKS: dict[str,float] = {}
 
 
-def hash_candidate(item: dict, task_id: str, stopped=lambda: False) -> dict:
+def hash_candidate(item: dict, task_id: str, stopped=lambda: False, persist=True) -> dict:
     path = Path(item['path'])
     expected = (item['size'], item['mtime_ns'], item['ctime_ns'])
     if core.signature(path) != expected:
@@ -124,7 +125,7 @@ def hash_candidate(item: dict, task_id: str, stopped=lambda: False) -> dict:
     read = 0
     text = bytearray()
     cache_text = path.suffix.lower().lstrip('.') in TEXT and item['size'] <= core.TEXT_LIMIT
-    last = 0.0
+    last = HASH_TICKS.get(task_id,0)
     with path.open('rb') as src:
         for block in iter(lambda: src.read(1024 * 1024), b''):
             if stopped():
@@ -137,6 +138,7 @@ def hash_candidate(item: dict, task_id: str, stopped=lambda: False) -> dict:
                 core.progress(task_id, 'hash', current_path=str(path), phase_bytes=read,
                               phase_total=item['size'], percent=100 * read / max(item['size'], 1))
                 last = time.monotonic()
+                HASH_TICKS[task_id]=last
     if core.signature(path) != expected:
         raise RuntimeError('源文件在读取时发生变化，等待下次扫描')
     value = None
@@ -147,7 +149,8 @@ def hash_candidate(item: dict, task_id: str, stopped=lambda: False) -> dict:
                 value = None
         except UnicodeDecodeError:
             pass
-    core.execute('UPDATE scan SET sha256=?,text_content=? WHERE task_id=? AND path=?',
-                 (h.hexdigest(), value, task_id, str(path)))
+    if persist:
+        core.execute('UPDATE scan SET sha256=?,text_content=? WHERE task_id=? AND path=?',
+                     (h.hexdigest(), value, task_id, str(path)))
     item.update(sha256=h.hexdigest(), text_content=value)
     return item
