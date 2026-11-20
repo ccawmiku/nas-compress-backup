@@ -10,7 +10,7 @@ URL = 'https://www.clouddrive2.com/api/clouddrive.proto'
 TARGET = Path(__file__).resolve().parents[1] / 'app/vendor'
 TARGET.mkdir(parents=True, exist_ok=True)
 data = urllib.request.urlopen(URL, timeout=60).read()
-EXPECTED_SHA256 = 'a00b4620cbce0a9bd6009f8e771ba68ea7375080ca7f15f4c7c206310ba2ec9d'
+EXPECTED_SHA256 = '838ebe12b7203510bc1749422a11a2f1c9d02dd9287503250074786f8b06b69b'
 if hashlib.sha256(data).hexdigest() != EXPECTED_SHA256:
     raise SystemExit('CloudDrive2 API definition changed; review and update the pinned checksum before building.')
 # The API is a build-time dependency, never a source of runtime credentials.
