@@ -5,7 +5,7 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM python:3.12-slim-bookworm
+FROM python:3.15-slim-bookworm
 LABEL org.opencontainers.image.source="https://github.com/ccawmiku/nas-compress-backup"
 LABEL org.opencontainers.image.description="Task-based NAS encrypted incremental backup with PAR2 and CloudDrive2"
 WORKDIR /app
