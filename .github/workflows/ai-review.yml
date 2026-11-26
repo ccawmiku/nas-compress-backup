@@ -31,8 +31,13 @@ jobs:
       )
     runs-on: ubuntu-latest
     steps:
-      - name: Run PR Agent
-        uses: qodo-ai/pr-agent@main
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+          enable-cache: false
+
+      - name: Run PR Agent (latest main with zh-cn i18n)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_KEY: ${{ secrets.AI_API_KEY }}
@@ -40,11 +45,17 @@ jobs:
           OPENAI__API_BASE: ${{ secrets.AI_API_BASE }}
           CONFIG__MODEL: "openai/deepseek-v4.1-flash-1017"
           CONFIG__FALLBACK_MODELS: '["openai/glm-5.3-flash"]'
-          CONFIG__RESPONSE_LANGUAGE: "zh-CN"
+          CONFIG__RESPONSE_LANGUAGE: "zh-cn"
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "64000"
           GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
           GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "true"
           GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "false"
           GITHUB_ACTION_CONFIG__PR_ACTIONS: '["opened", "reopened", "ready_for_review", "synchronize"]'
-          PR_REVIEWER__EXTRA_INSTRUCTIONS: "请重点关注 Bug、逻辑错误、安全隐患与边界条件，忽略纯代码风格问题。"
-          PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS: "请给出可直接采纳的精简代码修改建议，并用中文说明原因。"
+          PR_REVIEWER__EXTRA_INSTRUCTIONS: "请全程使用简体中文输出所有审查内容、摘要和建议，重点关注 Bug、逻辑错误、安全隐患与边界条件。"
+          PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS: "请全程使用简体中文说明问题和修改原因，并给出可直接采纳的精简代码建议。"
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/qodo-ai/pr-agent.git "$RUNNER_TEMP/pr-agent"
+          uv sync --project "$RUNNER_TEMP/pr-agent" --frozen --no-install-project --no-dev --extra github
+          PYTHONPATH="$RUNNER_TEMP/pr-agent" uv run --project "$RUNNER_TEMP/pr-agent" --no-sync python "$RUNNER_TEMP/pr-agent/pr_agent/servers/github_action_runner.py"
