@@ -48,6 +48,8 @@ jobs:
           CONFIG__FALLBACK_MODELS: '["openai/glm-5.3-flash", "openai/deepseek-v4-pro", "openai/glm-5.3"]'
           CONFIG__RESPONSE_LANGUAGE: "zh-cn"
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "64000"
+          CONFIG__AI_TIMEOUT: "45"
+          CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: "false"
           GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
           GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "true"
           GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "false"
