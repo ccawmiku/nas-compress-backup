@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import core
-from .cloud import Cloud, CloudError, pb
+from .cloud import Cloud, CloudError
 from .scan import LIVE, excluded
 from . import worker, archive
 

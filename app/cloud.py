@@ -1,19 +1,29 @@
 from __future__ import annotations
 
 import re
-import threading
+from importlib import import_module
 from urllib.parse import urlsplit
 
 import grpc
 from google.protobuf.empty_pb2 import Empty
 
 from . import core
-from .vendor import clouddrive_pb2 as pb
-from .vendor import clouddrive_pb2_grpc as rpc
 
 
 class CloudError(RuntimeError):
     pass
+
+
+def _bindings():
+    try:
+        pb = import_module('.vendor.clouddrive_pb2', __package__)
+        rpc = import_module('.vendor.clouddrive_pb2_grpc', __package__)
+    except (ImportError, ModuleNotFoundError) as error:
+        raise CloudError(
+            'CloudDrive2 protobuf bindings are missing; run '
+            '`python scripts/generate_proto.py` during the build'
+        ) from error
+    return pb, rpc
 
 
 def component(value: str) -> str:
@@ -32,11 +42,12 @@ class Cloud:
         target = parsed.netloc
         self.base_url = config['cloud_url'].rstrip('/')
         self.token = core.get_secrets().get('clouddrive_token', '')
+        self.pb, self.rpc = _bindings()
         if not self.token:
             raise CloudError('请先在设置中配置 CloudDrive2 API 令牌')
         self.channel = (grpc.secure_channel(target, grpc.ssl_channel_credentials()) if parsed.scheme == 'https'
                         else grpc.insecure_channel(target))
-        self.stub = rpc.CloudDriveFileSrvStub(self.channel)
+        self.stub = self.rpc.CloudDriveFileSrvStub(self.channel)
         self.metadata = (('authorization', 'Bearer ' + self.token),)
 
     def close(self):
@@ -54,7 +65,7 @@ class Cloud:
     def files(self, path: str, refresh=False) -> list:
         result = []
         try:
-            for reply in self.call('GetSubFiles', pb.ListSubFileRequest(path=path, forceRefresh=refresh), timeout=90):
+            for reply in self.call('GetSubFiles', self.pb.ListSubFileRequest(path=path, forceRefresh=refresh), timeout=90):
                 result.extend(reply.subFiles)
         except grpc.RpcError as error:
             raise CloudError('无法读取云端目录：' + error.code().name) from None
@@ -71,7 +82,7 @@ class Cloud:
         local = next((f for f in roots if f.isLocal and
                       (f.originalPath.rstrip('/') == '/upload' or f.name in ('NAS待上传', 'NAS压缩备份'))), None)
         if local is None:
-            login = self.call('APIAddLocalFolder', pb.AddLocalFolderRequest(
+            login = self.call('APIAddLocalFolder', self.pb.AddLocalFolderRequest(
                 localFolderPath='/upload', displayName='NAS压缩备份'))
             if not login.success:
                 raise CloudError('添加待上传目录失败：' + core.redact(login.errorMessage))
@@ -90,7 +101,7 @@ class Cloud:
             if not existing.isDirectory:
                 raise CloudError('目标文件夹名称已被文件占用')
             return existing.fullPathName
-        result = self.call('CreateFolder', pb.CreateFolderRequest(parentPath=parent, folderName=name), timeout=90)
+        result = self.call('CreateFolder', self.pb.CreateFolderRequest(parentPath=parent, folderName=name), timeout=90)
         if not result.result.success:
             raise CloudError('创建云端文件夹失败：' + core.redact(result.result.errorMessage))
         return result.folderCreated.fullPathName
@@ -108,14 +119,14 @@ class Cloud:
         return dest
 
     def start_copy(self, source: str, destination: str, overwrite=False):
-        result = self.call('CopyFile', pb.CopyFileRequest(
+        result = self.call('CopyFile', self.pb.CopyFileRequest(
             theFilePaths=[source], destPath=destination,
-            conflictPolicy=pb.CopyFileRequest.Overwrite if overwrite else pb.CopyFileRequest.Skip), timeout=90)
+            conflictPolicy=self.pb.CopyFileRequest.Overwrite if overwrite else self.pb.CopyFileRequest.Skip), timeout=90)
         if not result.success:
             raise CloudError('提交上传失败：' + core.redact(result.errorMessage))
 
     def uploads(self, destination: str) -> dict:
-        result = self.call('GetUploadFileList', pb.GetUploadFileListRequest(
+        result = self.call('GetUploadFileList', self.pb.GetUploadFileListRequest(
             getAll=True, filter=destination, itemsPerPage=500, pageNumber=1))
         # Avoid dependence on a generated field spelling across CloudDrive2 releases.
         entries = []
@@ -133,12 +144,12 @@ class Cloud:
     def delete_owned_group(self, path: str, task_dest: str):
         if not path.startswith(task_dest.rstrip('/') + '/groups/'):
             raise CloudError('拒绝删除任务仓库之外的目录')
-        result = self.call('DeleteFile', pb.FileRequest(path=path))
+        result = self.call('DeleteFile', self.pb.FileRequest(path=path))
         if not result.success:
             raise CloudError('清理无用组失败：' + core.redact(result.errorMessage))
 
     def download_info(self, path: str):
-        return self.call('GetDownloadUrlPath', pb.GetDownloadUrlPathRequest(
+        return self.call('GetDownloadUrlPath', self.pb.GetDownloadUrlPathRequest(
             path=path, preview=False, lazy_read=False, get_direct_url=False))
 
     def prune_catalog(self, path: str, keep: set[str], task_dest: str):
@@ -147,6 +158,6 @@ class Cloud:
         pattern = r'(?:current-index(?:-\d+-[0-9a-f]{24})?\.7z(?:\.\d+)?|catalog(?:-\d+-[0-9a-f]{24})?\.json)'
         for item in self.files(path, True):
             if not item.isDirectory and item.name not in keep and re.fullmatch(pattern,item.name):
-                result = self.call('DeleteFile', pb.FileRequest(path=path+'/'+item.name))
+                result = self.call('DeleteFile', self.pb.FileRequest(path=path+'/'+item.name))
                 if not result.success:
                     raise CloudError('旧索引清理未完成')
