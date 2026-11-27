@@ -30,7 +30,7 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
       - name: Set up uv
         uses: astral-sh/setup-uv@v10.4.0
@@ -38,14 +38,22 @@ jobs:
           python-version: "3.12"
           enable-cache: false
 
-      - name: Run PR Agent (latest main with zh-cn i18n)
+      - name: Prepare PR Agent
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/qodo-ai/pr-agent.git "$RUNNER_TEMP/pr-agent"
+          uv sync --project "$RUNNER_TEMP/pr-agent" --frozen --no-install-project --no-dev --extra github
+
+      - name: Run PR Agent (Primary Relay)
+        id: review_primary
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_KEY: ${{ secrets.AI_API_KEY }}
           OPENAI__KEY: ${{ secrets.AI_API_KEY }}
           OPENAI__API_BASE: ${{ secrets.AI_API_BASE }}
           CONFIG__MODEL: "openai/deepseek-v4.1-flash-1017"
-          CONFIG__FALLBACK_MODELS: '["openai/glm-5.3-flash", "openai/deepseek-v4-pro", "openai/glm-5.3"]'
+          CONFIG__FALLBACK_MODELS: '["openai/deepseek-v4.1-flash", "openai/glm-5.3-flash"]'
           CONFIG__RESPONSE_LANGUAGE: "zh-cn"
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "64000"
           CONFIG__AI_TIMEOUT: "45"
@@ -58,7 +66,28 @@ jobs:
           PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS: "请全程使用简体中文说明问题和修改原因，并给出可直接采纳的精简代码建议。"
           LITELLM_LOCAL_MODEL_COST_MAP: "True"
         run: |
-          set -euo pipefail
-          git clone --depth 1 https://github.com/qodo-ai/pr-agent.git "$RUNNER_TEMP/pr-agent"
-          uv sync --project "$RUNNER_TEMP/pr-agent" --frozen --no-install-project --no-dev --extra github
+          PYTHONPATH="$RUNNER_TEMP/pr-agent" uv run --project "$RUNNER_TEMP/pr-agent" --no-sync python "$RUNNER_TEMP/pr-agent/pr_agent/servers/github_action_runner.py"
+
+      - name: Run PR Agent (Backup Relay)
+        if: steps.review_primary.outcome == 'failure' && env.HAS_BACKUP == 'true'
+        env:
+          HAS_BACKUP: ${{ secrets.AI_API_KEY_2 != '' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_KEY: ${{ secrets.AI_API_KEY_2 }}
+          OPENAI__KEY: ${{ secrets.AI_API_KEY_2 }}
+          OPENAI__API_BASE: ${{ secrets.AI_API_BASE_2 }}
+          CONFIG__MODEL: "openai/deepseek-v4.1-flash"
+          CONFIG__FALLBACK_MODELS: '["openai/glm-5.3-flash"]'
+          CONFIG__RESPONSE_LANGUAGE: "zh-cn"
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "64000"
+          CONFIG__AI_TIMEOUT: "45"
+          CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: "false"
+          GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
+          GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "true"
+          GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "false"
+          GITHUB_ACTION_CONFIG__PR_ACTIONS: '["opened", "reopened", "ready_for_review", "synchronize"]'
+          PR_REVIEWER__EXTRA_INSTRUCTIONS: "请全程使用简体中文输出所有审查内容、摘要和建议，重点关注 Bug、逻辑错误、安全隐患与边界条件。"
+          PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS: "请全程使用简体中文说明问题和修改原因，并给出可直接采纳的精简代码建议。"
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+        run: |
           PYTHONPATH="$RUNNER_TEMP/pr-agent" uv run --project "$RUNNER_TEMP/pr-agent" --no-sync python "$RUNNER_TEMP/pr-agent/pr_agent/servers/github_action_runner.py"
