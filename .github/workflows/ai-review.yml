@@ -30,6 +30,7 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - name: Set up uv
         uses: astral-sh/setup-uv@v10.4.0
@@ -44,7 +45,7 @@ jobs:
           OPENAI__KEY: ${{ secrets.AI_API_KEY }}
           OPENAI__API_BASE: ${{ secrets.AI_API_BASE }}
           CONFIG__MODEL: "openai/deepseek-v4.1-flash-1017"
-          CONFIG__FALLBACK_MODELS: '["openai/glm-5.3-flash"]'
+          CONFIG__FALLBACK_MODELS: '["openai/glm-5.3-flash", "openai/deepseek-v4-pro", "openai/glm-5.3"]'
           CONFIG__RESPONSE_LANGUAGE: "zh-cn"
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "64000"
           GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
