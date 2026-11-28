@@ -4,6 +4,7 @@ name: AI Code Review
 #   1. cjms    中转站  deepseek-v4.1-flash
 #   2. xkrelay 中转站  deepseek-v4.1-flash-1017 -> deepseek-v4.1-flash -> glm-5.3-flash
 # 单次模型调用上限 180s；单条 relay 最多 3 个模型，故 job 上限设 25 分钟。
+# pr-agent 锁定在固定 commit，避免上游 main 变动同时打挂所有仓库。
 
 on:
   pull_request:
@@ -24,6 +25,7 @@ jobs:
   pr_agent_job:
     if: >-
       github.event.sender.type != 'Bot' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       (
         (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
         (
@@ -48,9 +50,14 @@ jobs:
           enable-cache: false
 
       - name: Prepare PR Agent
+        env:
+          PR_AGENT_COMMIT: "97de097459a45954887806792427219827d00009"
         run: |
           set -euo pipefail
-          git clone --depth 1 https://github.com/qodo-ai/pr-agent.git "$RUNNER_TEMP/pr-agent"
+          git init -q "$RUNNER_TEMP/pr-agent"
+          git -C "$RUNNER_TEMP/pr-agent" remote add origin https://github.com/qodo-ai/pr-agent.git
+          git -C "$RUNNER_TEMP/pr-agent" fetch -q --depth 1 origin "$PR_AGENT_COMMIT"
+          git -C "$RUNNER_TEMP/pr-agent" checkout -q --detach FETCH_HEAD
           uv sync --project "$RUNNER_TEMP/pr-agent" --frozen --no-install-project --no-dev --extra github
 
       - name: "Run PR Agent (Primary: cjms)"
@@ -64,6 +71,7 @@ jobs:
           CONFIG__MODEL: "openai/deepseek-v4.1-flash"
           CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__RESPONSE_LANGUAGE: "zh-cn"
+          # 上下文窗口预算（不是输出上限）；64000 为保守值，超出会触发 diff 压缩
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "64000"
           CONFIG__AI_TIMEOUT: "180"
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: "false"
@@ -88,6 +96,7 @@ jobs:
           CONFIG__MODEL: "openai/deepseek-v4.1-flash-1017"
           CONFIG__FALLBACK_MODELS: '["openai/deepseek-v4.1-flash", "openai/glm-5.3-flash"]'
           CONFIG__RESPONSE_LANGUAGE: "zh-cn"
+          # 上下文窗口预算（不是输出上限）；64000 为保守值，超出会触发 diff 压缩
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "64000"
           CONFIG__AI_TIMEOUT: "180"
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: "false"
