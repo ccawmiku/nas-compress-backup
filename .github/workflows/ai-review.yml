@@ -3,7 +3,8 @@ name: AI Code Review
 # 审查链路（按顺序降级）：
 #   1. cjms    中转站  deepseek-v4.1-flash
 #   2. xkrelay 中转站  deepseek-v4.1-flash-1017 -> deepseek-v4.1-flash -> glm-5.3-flash
-# 单次模型调用上限 180s；单条 relay 最多 3 个模型，故 job 上限设 25 分钟。
+# 中转站经 Cloudflare，整包响应硬上限 120s（超出直接返回 524），故单次调用设 115s。
+# 单条 relay 最多 3 个模型，两条 relay 合计约 11.5 分钟，job 上限设 25 分钟。
 # pr-agent 锁定在固定 commit，避免上游 main 变动同时打挂所有仓库。
 
 on:
@@ -73,7 +74,7 @@ jobs:
           CONFIG__RESPONSE_LANGUAGE: "zh-cn"
           # 上下文窗口预算（不是输出上限）；64000 为保守值，超出会触发 diff 压缩
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "64000"
-          CONFIG__AI_TIMEOUT: "180"
+          CONFIG__AI_TIMEOUT: "115"
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: "false"
           GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
           GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "true"
@@ -98,7 +99,7 @@ jobs:
           CONFIG__RESPONSE_LANGUAGE: "zh-cn"
           # 上下文窗口预算（不是输出上限）；64000 为保守值，超出会触发 diff 压缩
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "64000"
-          CONFIG__AI_TIMEOUT: "180"
+          CONFIG__AI_TIMEOUT: "115"
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: "false"
           GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
           GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "true"
