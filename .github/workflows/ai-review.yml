@@ -1,5 +1,10 @@
 name: AI Code Review
 
+# 审查链路（按顺序降级）：
+#   1. cjms    中转站  deepseek-v4.1-flash
+#   2. xkrelay 中转站  deepseek-v4.1-flash-1017 -> deepseek-v4.1-flash -> glm-5.3-flash
+# 单次模型调用上限 180s；单条 relay 最多 3 个模型，故 job 上限设 25 分钟。
+
 on:
   pull_request:
     types: [opened, reopened, ready_for_review, synchronize]
@@ -10,6 +15,10 @@ permissions:
   contents: read
   issues: write
   pull-requests: write
+
+concurrency:
+  group: 'ai-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}'
+  cancel-in-progress: true
 
 jobs:
   pr_agent_job:
@@ -30,7 +39,7 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - name: Set up uv
         uses: astral-sh/setup-uv@v10.4.0
@@ -44,19 +53,19 @@ jobs:
           git clone --depth 1 https://github.com/qodo-ai/pr-agent.git "$RUNNER_TEMP/pr-agent"
           uv sync --project "$RUNNER_TEMP/pr-agent" --frozen --no-install-project --no-dev --extra github
 
-      - name: Run PR Agent (Primary Relay)
+      - name: "Run PR Agent (Primary: cjms)"
         id: review_primary
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENAI_KEY: ${{ secrets.AI_API_KEY }}
-          OPENAI__KEY: ${{ secrets.AI_API_KEY }}
-          OPENAI__API_BASE: ${{ secrets.AI_API_BASE }}
-          CONFIG__MODEL: "openai/deepseek-v4.1-flash-1017"
-          CONFIG__FALLBACK_MODELS: '["openai/deepseek-v4.1-flash", "openai/glm-5.3-flash"]'
+          OPENAI_KEY: ${{ secrets.AI_API_KEY_2 }}
+          OPENAI__KEY: ${{ secrets.AI_API_KEY_2 }}
+          OPENAI__API_BASE: ${{ secrets.AI_API_BASE_2 }}
+          CONFIG__MODEL: "openai/deepseek-v4.1-flash"
+          CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__RESPONSE_LANGUAGE: "zh-cn"
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "64000"
-          CONFIG__AI_TIMEOUT: "45"
+          CONFIG__AI_TIMEOUT: "180"
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: "false"
           GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
           GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "true"
@@ -68,19 +77,19 @@ jobs:
         run: |
           PYTHONPATH="$RUNNER_TEMP/pr-agent" uv run --project "$RUNNER_TEMP/pr-agent" --no-sync python "$RUNNER_TEMP/pr-agent/pr_agent/servers/github_action_runner.py"
 
-      - name: Run PR Agent (Backup Relay)
+      - name: "Run PR Agent (Backup: xkrelay)"
         if: steps.review_primary.outcome == 'failure' && env.HAS_BACKUP == 'true'
         env:
-          HAS_BACKUP: ${{ secrets.AI_API_KEY_2 != '' }}
+          HAS_BACKUP: ${{ secrets.AI_API_KEY != '' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENAI_KEY: ${{ secrets.AI_API_KEY_2 }}
-          OPENAI__KEY: ${{ secrets.AI_API_KEY_2 }}
-          OPENAI__API_BASE: ${{ secrets.AI_API_BASE_2 }}
-          CONFIG__MODEL: "openai/deepseek-v4.1-flash"
-          CONFIG__FALLBACK_MODELS: '["openai/glm-5.3-flash"]'
+          OPENAI_KEY: ${{ secrets.AI_API_KEY }}
+          OPENAI__KEY: ${{ secrets.AI_API_KEY }}
+          OPENAI__API_BASE: ${{ secrets.AI_API_BASE }}
+          CONFIG__MODEL: "openai/deepseek-v4.1-flash-1017"
+          CONFIG__FALLBACK_MODELS: '["openai/deepseek-v4.1-flash", "openai/glm-5.3-flash"]'
           CONFIG__RESPONSE_LANGUAGE: "zh-cn"
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "64000"
-          CONFIG__AI_TIMEOUT: "45"
+          CONFIG__AI_TIMEOUT: "180"
           CONFIG__RETRY_SAME_MODEL_ON_TIMEOUT: "false"
           GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
           GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "true"
